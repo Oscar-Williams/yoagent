@@ -112,7 +112,7 @@ with `--manifest-path integrations/yoagent-rutis/Cargo.toml` from the repo
 root (a tool plugin, a policy plugin that denies a tool by name and caps
 calls per tool, and a redactor).
 
-## TypeScript and Python plugins
+## Plugins in other languages
 
 With a language feature, `RutisBridge::install` also provides the registry
 to plugins in other languages, through
@@ -123,6 +123,7 @@ service `yoagent`:
 |---|---|
 | *(default)* | Rust plugins only |
 | `node` | TypeScript / JavaScript plugins in local Node runtimes (Node 22.19+, Linux/macOS) |
+| `bun` | the same TypeScript / JavaScript plugins in local Bun runtimes (Bun 1.4+, Linux/macOS): rows `bun:<module>`, no build step; local only — rutis's Bun runtime cannot listen remotely yet |
 | `python` | Python plugins in local Python runtimes (Python 3.10+, Linux/macOS) |
 | `websocket` | runtimes and nodes on other machines, over `wss` |
 

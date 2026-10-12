@@ -26,7 +26,7 @@
 //! yoagent itself knows nothing about rutis; the bridge uses only yoagent's
 //! public API.
 //!
-//! TypeScript and Python handlers (features `node`, `python`, `websocket`)
+//! TypeScript and Python handlers (features `node`, `bun`, `python`, `websocket`)
 //! can return images in tool results and write logs into the host's
 //! `tracing` output (target `yoagent_rutis::plugin`). Plugins from other
 //! agent ecosystems — DSH tool plugins, pi extensions — plug in through
@@ -85,9 +85,9 @@
 //!
 //! [`AgentPlugin`] wraps a handler as a plugin in one expression.
 //!
-//! # TypeScript and Python plugins
+//! # Plugins in other languages
 //!
-//! With the `node`, `python` or `websocket` feature (rutis-bridge 0.9),
+//! With the `node`, `bun`, `python` or `websocket` feature (rutis-bridge 0.9),
 //! [`RutisBridge::install`] also provides the registry to plugins in other
 //! languages, as the host service `yoagent`. Such a plugin registers an
 //! object (or a Python dict) of async functions, with the same hooks and the
@@ -147,10 +147,20 @@ pub mod events;
 pub mod extension;
 pub mod handler;
 mod host;
-#[cfg(any(feature = "node", feature = "python", feature = "websocket"))]
+#[cfg(any(
+    feature = "node",
+    feature = "python",
+    feature = "bun",
+    feature = "websocket"
+))]
 #[cfg_attr(
     docsrs,
-    doc(cfg(any(feature = "node", feature = "python", feature = "websocket")))
+    doc(cfg(any(
+        feature = "node",
+        feature = "python",
+        feature = "bun",
+        feature = "websocket"
+    )))
 )]
 pub mod languages;
 pub mod plugin;

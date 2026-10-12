@@ -1,12 +1,16 @@
-//! TypeScript and Python plugins, end to end: real Node and Python runtimes
-//! (rutis-bridge 0.9), loaded as rows by rutis-loader, registering handlers
-//! through the `yoagent` host service.
+//! TypeScript and Python plugins, end to end: real Node, Bun and Python
+//! runtimes (rutis-bridge 0.9), loaded as rows by rutis-loader, registering
+//! handlers through the `yoagent` host service. The TypeScript fixtures run
+//! on Node and, for the hooks, fail-closed policies and cancel handles, on
+//! Bun too.
 //!
 //! Needs Node 22.19+ with `npm ci` run in `plugins/` (for `@arcships/rutis` and
 //! `@arcships/rutis-runtime` 0.9.1), and Python 3.10+ with `rutis` 0.9 —
 //! `plugins/.venv/bin/python` (`uv venv plugins/.venv --python 3.12 && uv pip
 //! install --python plugins/.venv/bin/python rutis==0.9.1`), or the
-//! interpreter in `YOAGENT_RUTIS_PYTHON`. A test whose runtime is missing
+//! interpreter in `YOAGENT_RUTIS_PYTHON`; Bun 1.4+ (`YOAGENT_RUTIS_BUN`, else
+//! `bun` on `PATH`) with `@arcships/rutis-bun` 0.9 from that `npm ci`. A test
+//! whose runtime is missing
 //! prints why and passes; set `YOAGENT_RUTIS_REQUIRE_RUNTIMES=1` (CI does) to
 //! make a missing runtime fail instead.
 #![cfg(unix)]
@@ -93,6 +97,65 @@ fn node_runtime() -> Option<PathBuf> {
         None => skip(
             "Node",
             format!("{} missing: run `npm ci` in plugins/", runtime.display()),
+        ),
+    }
+}
+
+/// The Bun runtime package (`@arcships/rutis-bun`, from `npm ci` in
+/// `plugins/`) and a Bun 1.4+ executable: `YOAGENT_RUTIS_BUN`, else `bun` on
+/// `PATH`.
+fn bun_runtime() -> Option<(PathBuf, PathBuf)> {
+    let package = plugins_dir().join("node_modules/@arcships/rutis-bun");
+    // The version too, as for Node: a stale install would run the 0.9
+    // bridge against another runtime and pass or fail for the wrong reason.
+    let installed = std::fs::read_to_string(package.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|manifest| manifest["version"].as_str().map(str::to_owned));
+    match installed {
+        Some(version) if version.starts_with("0.9.") => {}
+        Some(version) => {
+            return skip(
+                "Bun",
+                format!(
+                    "{} is {version}, 0.9 needed: run `npm ci` in plugins/",
+                    package.display()
+                ),
+            )
+        }
+        None => {
+            return skip(
+                "Bun",
+                format!("{} missing: run `npm ci` in plugins/", package.display()),
+            )
+        }
+    }
+    let bun = std::env::var_os("YOAGENT_RUTIS_BUN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("bun"));
+    let version = Command::new(&bun)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .split('.')
+                .map(|n| n.parse::<u32>().ok())
+                .take(2)
+                .collect::<Option<Vec<u32>>>()
+                .map(|v| (v[0], v.get(1).copied().unwrap_or(0)))
+        });
+    match version {
+        Some(version) if version >= (1, 4) => Some((package, bun)),
+        Some((major, minor)) => skip(
+            "Bun",
+            format!("{} is Bun {major}.{minor}, 1.4+ needed", bun.display()),
+        ),
+        None => skip(
+            "Bun",
+            format!("no Bun at {} (set YOAGENT_RUTIS_BUN)", bun.display()),
         ),
     }
 }
@@ -189,6 +252,16 @@ struct Host {
 }
 
 async fn host(node: Option<&Path>, python: Option<(&Path, &Path)>) -> Host {
+    host_with(node, python, None).await
+}
+
+/// [`host`], with a Bun runtime too (its package, its executable): rows
+/// `bun:<module>`.
+async fn host_with(
+    node: Option<&Path>,
+    python: Option<(&Path, &Path)>,
+    bun: Option<(&Path, &Path)>,
+) -> Host {
     let root = Ctx::root().unwrap();
     let bridge = RutisBridge::install(&root).unwrap();
     let probe = Probe::default();
@@ -201,6 +274,13 @@ async fn host(node: Option<&Path>, python: Option<(&Path, &Path)>) -> Host {
     let mut rows = Vec::new();
     if let Some((modules, interpreter)) = python {
         let runtime = LocalRuntime::python(modules).interpreter(interpreter);
+        let resolver = Arc::new(RuntimeResolver::modules(runtime.handle()).with_catalog(&catalog));
+        root.plugin(runtime);
+        chain = chain.with_shared(resolver.clone());
+        rows.push(resolver);
+    }
+    if let Some((package, executable)) = bun {
+        let runtime = LocalRuntime::bun(package, plugins_dir()).interpreter(executable);
         let resolver = Arc::new(RuntimeResolver::modules(runtime.handle()).with_catalog(&catalog));
         root.plugin(runtime);
         chain = chain.with_shared(resolver.clone());
@@ -284,6 +364,11 @@ impl Host {
 
 fn ts_row(id: &str, file: &Path, config: Value) -> Value {
     json!({ "id": id, "name": file.to_string_lossy(), "config": config })
+}
+
+/// A row of the Bun runtime: the same plugin file, run by Bun.
+fn bun_row(id: &str, file: &Path, config: Value) -> Value {
+    json!({ "id": id, "name": format!("bun:{}", file.to_string_lossy()), "config": config })
 }
 
 fn py_row(id: &str, module: &str, config: Value) -> Value {
@@ -715,7 +800,23 @@ async fn a_typescript_handler_gets_every_hook() {
     };
     let fx = fixtures();
     let host = host(Some(&node), None).await;
-    host.load(vec![ts_row("hooks", &fx.js, json!({}))]).await;
+    every_hook(host, ts_row("hooks", &fx.js, json!({}))).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bun_handler_gets_every_hook() {
+    let Some((package, bun)) = bun_runtime() else {
+        return;
+    };
+    let fx = fixtures();
+    let host = host_with(None, None, Some((&package, &bun))).await;
+    every_hook(host, bun_row("hooks", &fx.js, json!({}))).await;
+}
+
+/// The `JS_HOOKS` plugin, loaded by `row`: every hook, as the TypeScript
+/// test describes, whichever JavaScript runtime runs it.
+async fn every_hook(host: Host, row: Value) {
+    host.load(vec![row]).await;
     host.until_handlers(&["js-hooks"]).await;
 
     let (agent, seen) = agent(vec![
@@ -795,7 +896,23 @@ async fn a_throwing_slow_or_malformed_language_policy_denies() {
     };
     let fx = fixtures();
     let host = host(Some(&node), None).await;
-    host.load(vec![ts_row("hooks", &fx.js, json!({}))]).await;
+    policies_fail_closed(host, ts_row("hooks", &fx.js, json!({}))).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_throwing_slow_or_malformed_bun_policy_denies() {
+    let Some((package, bun)) = bun_runtime() else {
+        return;
+    };
+    let fx = fixtures();
+    let host = host_with(None, None, Some((&package, &bun))).await;
+    policies_fail_closed(host, bun_row("hooks", &fx.js, json!({}))).await;
+}
+
+/// The `JS_HOOKS` plugin, loaded by `row`: a policy that throws, one that
+/// never answers and one that answers nonsense all deny.
+async fn policies_fail_closed(host: Host, row: Value) {
+    host.load(vec![row]).await;
     host.until_handlers(&["js-hooks"]).await;
     let tools: Vec<Reply> = ["fail_policy", "slow_policy", "odd_policy"]
         .iter()
@@ -1236,8 +1353,23 @@ async fn a_typescript_hook_sees_its_signal_abort_on_cancel_and_timeout() {
     };
     let fx = fixtures();
     let host = host(Some(&node), None).await;
-    host.load(vec![ts_row("cancel", &fx.cancel, json!({}))])
-        .await;
+    signal_aborts(host, ts_row("cancel", &fx.cancel, json!({}))).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bun_hook_sees_its_signal_abort_on_cancel_and_timeout() {
+    let Some((package, bun)) = bun_runtime() else {
+        return;
+    };
+    let fx = fixtures();
+    let host = host_with(None, None, Some((&package, &bun))).await;
+    signal_aborts(host, bun_row("cancel", &fx.cancel, json!({}))).await;
+}
+
+/// The `JS_CANCEL` plugin, loaded by `row`: a call's signal aborts on run
+/// cancel and on a hook timeout, never after it completed.
+async fn signal_aborts(host: Host, row: Value) {
+    host.load(vec![row]).await;
     host.until_handlers(&["js-cancel"]).await;
 
     let (quick, _) = agent(vec![
