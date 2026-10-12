@@ -1,11 +1,11 @@
 //! TypeScript and Python plugins, end to end: real Node and Python runtimes
-//! (rutis-bridge 0.8), loaded as rows by rutis-loader, registering handlers
+//! (rutis-bridge 0.9), loaded as rows by rutis-loader, registering handlers
 //! through the `yoagent` host service.
 //!
 //! Needs Node 24+ with `npm ci` run in `plugins/` (for `@arcships/rutis` and
-//! `@arcships/rutis-runtime` 0.8.0), and Python 3.12+ with `rutis` 0.8 —
+//! `@arcships/rutis-runtime` 0.9.1), and Python 3.10+ with `rutis` 0.9 —
 //! `plugins/.venv/bin/python` (`uv venv plugins/.venv --python 3.12 && uv pip
-//! install --python plugins/.venv/bin/python rutis==0.8.0`), or the
+//! install --python plugins/.venv/bin/python rutis==0.9.1`), or the
 //! interpreter in `YOAGENT_RUTIS_PYTHON`. A test whose runtime is missing
 //! prints why and passes; set `YOAGENT_RUTIS_REQUIRE_RUNTIMES=1` (CI does) to
 //! make a missing runtime fail instead.
@@ -70,18 +70,18 @@ fn node_runtime() -> Option<PathBuf> {
         Some(major) => return skip("Node", format!("Node {major} found, 24+ needed")),
         None => return skip("Node", "no `node` on PATH".into()),
     }
-    // The version too, as for Python: a stale install would run the 0.8
+    // The version too, as for Python: a stale install would run the 0.9
     // bridge against an older runtime and pass or fail for the wrong reason.
     let installed = std::fs::read_to_string(runtime.join("package.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|manifest| manifest["version"].as_str().map(str::to_owned));
     match installed {
-        Some(version) if version.starts_with("0.8.") => Some(runtime),
+        Some(version) if version.starts_with("0.9.") => Some(runtime),
         Some(version) => skip(
             "Node",
             format!(
-                "{} is {version}, 0.8 needed: run `npm ci` in plugins/",
+                "{} is {version}, 0.9 needed: run `npm ci` in plugins/",
                 runtime.display()
             ),
         ),
@@ -92,7 +92,7 @@ fn node_runtime() -> Option<PathBuf> {
     }
 }
 
-/// A Python 3.12+ interpreter with rutis 0.8.
+/// A Python 3.10+ interpreter with rutis 0.9.
 fn python() -> Option<PathBuf> {
     let python = std::env::var_os("YOAGENT_RUTIS_PYTHON")
         .map(PathBuf::from)
@@ -101,18 +101,18 @@ fn python() -> Option<PathBuf> {
         .args([
             "-c",
             "import sys, importlib.metadata as m; \
-             print(sys.version_info >= (3, 12), m.version('rutis'))",
+             print(sys.version_info >= (3, 10), m.version('rutis'))",
         ])
         .output();
     match probe {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             match text.split_once(' ') {
-                Some(("True", version)) if version.starts_with("0.8.") => Some(python),
+                Some(("True", version)) if version.starts_with("0.9.") => Some(python),
                 _ => skip(
                     "Python",
                     format!(
-                        "{} reports `{text}`: Python 3.12+ and rutis 0.8 needed",
+                        "{} reports `{text}`: Python 3.10+ and rutis 0.9 needed",
                         python.display()
                     ),
                 ),
@@ -1370,5 +1370,76 @@ async fn image_tool_results_cross_both_ways_in_typescript_and_python() {
     // py_image: text + image from call_tool, and Python's edit kept only the image.
     let (_, py) = &results[1];
     assert!(py.len() == 1 && image(&py[0]), "{py:?}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// A handler that reads the conversation (`messages: true`) and offers a
+/// tool: it records what it saw, and the tool shows its runtime is alive.
+const JS_BIG: &str = r#"
+import { definePlugin } from 'RUTIS'
+export default definePlugin({
+  inject: ['yoagent', 'probe'],
+  apply(ctx) {
+    const probe = ctx.use('probe')
+    ctx.effect(ctx.use('yoagent').register('js-big', {
+      async before_model(turn) {
+        const seen = JSON.stringify(turn.messages)
+        probe.record(`js-big saw ${(seen.match(/too large to send to a plugin/g) ?? []).length} omitted, ${seen.length} chars`)
+      },
+      async tools() { return [{ name: 'still_here', description: 'answers if the runtime lives' }] },
+      async call_tool() { return 'alive' },
+    }, { messages: true }))
+  },
+})
+"#;
+
+/// rutis 0.9 closes a local channel on a message over 16 MiB, ending the
+/// runtime. A conversation holding more than that in images still reaches a
+/// handler that reads it — the images as text — and the runtime lives on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conversation_over_the_message_limit_reaches_a_plugin_without_its_images() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let rutis = plugins_dir()
+        .join("node_modules/@arcships/rutis/src/index.mjs")
+        .canonicalize()
+        .map(|p| format!("file://{}", p.display()))
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big.mjs");
+    std::fs::write(&file, JS_BIG.replace("RUTIS", &rutis)).unwrap();
+    let host = host(Some(&node), None).await;
+    host.load(vec![ts_row("big", &file, json!({}))]).await;
+    host.until_handlers(&["js-big"]).await;
+
+    // Two 8 MB pictures, about 21 MB as base64.
+    let picture = || Content::Image {
+        data: "A".repeat(8 * 1024 * 1024 / 3 * 4),
+        mime_type: "image/png".into(),
+    };
+    let earlier = AgentMessage::Llm(Message::User {
+        content: vec![
+            Content::Text {
+                text: "two screenshots".into(),
+            },
+            picture(),
+            picture(),
+        ],
+        timestamp: 0,
+    });
+    let (agent, _) = agent(vec![call("still_here", json!({})), text("done")]);
+    let mut agent = agent
+        .with_messages(vec![earlier])
+        .with_extension(host.bridge.extension().required());
+    run(&mut agent, "go on").await;
+
+    let saw = host.probe.wait_line(|l| l.starts_with("js-big saw")).await;
+    assert!(saw.starts_with("js-big saw 2 omitted"), "{saw}");
+    let answered = agent.messages().iter().any(|m| {
+        matches!(m, AgentMessage::Llm(Message::ToolResult { content, .. })
+            if matches!(content.as_slice(), [Content::Text { text }] if text == "alive"))
+    });
+    assert!(answered, "the runtime died: {:?}", host.probe.lines());
     host.root.shutdown().await.unwrap();
 }

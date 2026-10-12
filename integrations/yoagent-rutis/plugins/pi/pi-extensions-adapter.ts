@@ -306,7 +306,7 @@ interface HostUi {
 const hostUi = (ui: HostUi, contextSignal?: AbortSignal) => {
   const ask = async (request: Record<string, unknown>, opts?: { timeout?: number; signal?: AbortSignal }) => {
     // When the hook is cancelled (the run stopped, the policy timed out) the
-    // question is withdrawn: frontends close its dialog. rutis 0.8's JavaScript runtime cannot
+    // question is withdrawn: frontends close its dialog. rutis's JavaScript runtime (as of 0.9) cannot
     // cancel a plugin's call to the host, so the adapter says so by key.
     const signal = opts?.signal ?? contextSignal
     if (signal?.aborted) return undefined
@@ -421,15 +421,49 @@ function text(content: Block[] | undefined): string {
   return (content ?? []).map((block) => (block.type === 'text' ? (block.text ?? '') : `[${block.type} block]`)).join('\n')
 }
 
-/** pi's content blocks as yoagent's (the same shape for text and images); any other block is named in text. */
+/**
+ * Most base64 one result may carry in images: rutis (0.9) closes the channel
+ * on a message over 16 MiB, which would end this runtime and every plugin in it.
+ */
+const MAX_RESULT_IMAGE_CHARS = 12 * 1024 * 1024
+
+/**
+ * pi's content blocks as yoagent's (the same shape for text and images); any other block is named in text,
+ * and images past MAX_RESULT_IMAGE_CHARS together are left out, named.
+ */
 function blocks(content: Block[] | undefined): ContentBlock[] {
+  let imageChars = 0
   return (content ?? []).map((block): ContentBlock => {
     if (block.type === 'text') return { type: 'text', text: block.text ?? '' }
     if (block.type === 'image' && block.data && block.mimeType) {
+      if (imageChars + block.data.length > MAX_RESULT_IMAGE_CHARS) {
+        return { type: 'text', text: `[${block.mimeType}: left out, the result's images are too large together]` }
+      }
+      imageChars += block.data.length
       return { type: 'image', data: block.data, mimeType: block.mimeType }
     }
     return { type: 'text', text: `[${block.type} block]` }
   })
+}
+
+/**
+ * A message as `message_end`'s seen-set keys it: each image as its type and
+ * size, the same whether it came whole or — over the bridge's message limit —
+ * as the host's placeholder text, so a message is checked once either way.
+ */
+function seenAs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(seenAs)
+  if (!value || typeof value !== 'object') return value
+  const block = value as Record<string, unknown>
+  if (block.type === 'image' && typeof block.data === 'string') {
+    const mb = ((Math.floor(block.data.length / 4) * 3) / (1024 * 1024)).toFixed(1)
+    return { image: `${block.mimeType ?? 'image'}, ${mb} MB` }
+  }
+  if (block.type === 'text' && typeof block.text === 'string') {
+    const placeholder = /^\[(.+), (\d+\.\d) MB: omitted, too large to send to a plugin\]$/.exec(block.text)
+    if (placeholder) return { image: `${placeholder[1]}, ${placeholder[2]} MB` }
+  }
+  return Object.fromEntries(Object.entries(block).map(([k, v]) => [k, seenAs(v)]))
 }
 
 /**
@@ -878,7 +912,7 @@ export default definePlugin<Config>({
         let seen = ended.get(runId)
         if (!seen) ended.set(runId, (seen = new Set()))
         for (const original of messages) {
-          const key = canon(original)
+          const key = canon(seenAs(original))
           if (seen.has(key)) continue
           for (const { ext, fn } of listeners) {
             const copy = piMessage(original)
