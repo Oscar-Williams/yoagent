@@ -323,6 +323,28 @@ share `yoagent` in the loader's catalog. `plugins/dsh/package.json` pins
 everything exactly (dsh 0.2.0-rc.2 is a release candidate) and is its own
 install, so the language tests' stays small.
 
+**DSH's own services, for plugins that need them.** Many dsh plugins wait
+for services of the DSH host — files, attachments, credentials, storage,
+session persistence, skills. DSH ships each as a package, and they run
+headless: [`plugins/dsh/host-services.json`](plugins/dsh/host-services.json)
+lists them as rows (`dsh-fs-local`, `dsh-attachment-local`,
+`dsh-credentials-local`, `dsh-storage`, `dsh-session-persistence`,
+`dsh-skill`, `dsh-skill-filesystem`); load them before the plugins, and
+only for plugins that need them. Attachments, the credentials file
+(`.credentials.yaml`, mode 600) and skills live under `DSH_HOME`, else
+`~/.dsh`, and skills also under `DSH_AGENTS_HOME`, else `~/.agents`: **give
+the runtime homes of the host's own** (rutis's `Launcher::env`;
+yoagent-frontend's `PluginHostBuilder::env` and `DshHome`) unless the
+plugins should see the user's DSH keys and skills. That keeps those
+directories out, not everything: the runtime inherits the host's
+environment, which DSH's credentials service reads first (an API key there
+is readable), it reads the project's `.env` and skill folders, and
+`dsh-fs-local` gives plugins the whole filesystem. A plugin that
+needs DSH's app — its web server and UI, its model layer (`llm`), agents,
+`settings` — still does not run; the
+[plugin compatibility](../../docs/evals/plugin-compatibility.md) report
+says which, per package.
+
 ```sh
 (cd plugins/dsh && npm ci)
 cargo run --features node --example dsh_tools            # scripted model, real web search: needs network
@@ -334,8 +356,9 @@ cargo run --features node --example dsh_tools -- --live  # DeepSeek: DEEPSEEK_AP
 the adapter, runs one search, and checks that a dsh tool answered (and,
 scripted, that free-search's prompt section reached the model).
 `tests/dsh_test.rs` covers the adapter offline with a fixture dsh plugin
-(`plugins/dsh/fixture-tools.ts`) and, for images, a stand-in attachment
-store (`plugins/dsh/fixture-attachments.ts`).
+(`plugins/dsh/fixture-tools.ts`), for images a stand-in attachment
+store (`plugins/dsh/fixture-attachments.ts`), and that the host services
+start headless in a `DSH_HOME` of their own.
 
 **Asking the user.** On its own, a dsh tool call the adapter makes cannot
 reach a person: an `ask` from a dsh tool policy is denied, and

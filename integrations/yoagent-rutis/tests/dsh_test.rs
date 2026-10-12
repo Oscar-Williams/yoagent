@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use common::*;
 use rutis::Ctx;
-use rutis_bridge::runtime::LocalRuntime;
+use rutis_bridge::runtime::{Launcher, LocalRuntime};
 use rutis_bridge::session::{
     host_key, Error as BridgeError, HostDispatch, Reply, Value as BridgeValue,
 };
@@ -122,6 +122,11 @@ impl HostDispatch for ScriptedUi {
 }
 
 async fn host(runtime: &Path, ui: Option<Arc<ScriptedUi>>) -> Host {
+    host_with(runtime, ui, &[]).await
+}
+
+/// [`host`], the DSH runtime's process given `env` on top of what it inherits.
+async fn host_with(runtime: &Path, ui: Option<Arc<ScriptedUi>>, env: &[(&str, &Path)]) -> Host {
     let root = Ctx::root().unwrap();
     let bridge = RutisBridge::install(&root).unwrap();
     let mut catalog = ServiceCatalog::new();
@@ -131,7 +136,12 @@ async fn host(runtime: &Path, ui: Option<Arc<ScriptedUi>>) -> Host {
         root.provide_as::<dyn HostDispatch>(host_key("ui"), ui)
             .unwrap();
     }
-    let node = LocalRuntime::node(runtime, dsh_dir().join("package.json"));
+    let launcher = env
+        .iter()
+        .fold(Launcher::node(runtime), |launcher, (name, value)| {
+            launcher.env(*name, *value)
+        });
+    let node = LocalRuntime::launcher("node", launcher, dsh_dir().join("package.json"));
     let resolver = Arc::new(RuntimeResolver::node(node.handle()).with_catalog(&catalog));
     root.plugin(node);
     let plugin = LoaderPlugin::new(
@@ -626,6 +636,185 @@ async fn without_a_frontend_a_dsh_ask_is_denied() {
                 ui.asked.lock().unwrap().is_empty(),
                 "no frontend: not asked"
             );
+        }
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// `plugins/dsh/host-services.json`: DSH's own services start headless, and
+/// with `DSH_HOME` / `DSH_AGENTS_HOME` set they use that home, not the
+/// user's: a plugin reads a key stored there through DSH's credentials
+/// service, and nothing is created under `HOME` (pointed at an empty dir).
+/// The services DSH plugins wait for exist in the runtime (checked from
+/// inside it, as a plugin sees them).
+#[tokio::test(flavor = "multi_thread")]
+async fn dsh_host_services_start_headless_in_their_own_dsh_home() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("dsh-home");
+    let agents = dir.path().join("agents");
+    let user = dir.path().join("user");
+    for d in [&home, &user] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        home.join(".credentials.yaml"),
+        "version: 1\nrefs:\n  YOAGENT_TEST_KEY: from-the-given-home\n",
+    )
+    .unwrap();
+    // DSH refuses a credentials file others can read.
+    std::fs::set_permissions(
+        home.join(".credentials.yaml"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    let services_out = dir.path().join("services.json");
+    let key_out = dir.path().join("key.txt");
+    // A plain Cordis plugin reading one key through the credentials service.
+    let reader = dir.path().join("read-key.mjs");
+    std::fs::write(
+        &reader,
+        format!(
+            "import {{ writeFileSync }} from 'node:fs'\n\
+             export const name = 'read-key'\n\
+             export const inject = ['credentials']\n\
+             export async function apply(ctx) {{\n\
+               const found = await ctx.credentials.resolve('YOAGENT_TEST_KEY')\n\
+               writeFileSync({:?}, String(found?.value) + ' ' + String(found?.source))\n\
+             }}\n",
+            key_out.display().to_string()
+        ),
+    )
+    .unwrap();
+    let host = host_with(
+        &runtime,
+        None,
+        &[
+            ("DSH_HOME", &home),
+            ("DSH_AGENTS_HOME", &agents),
+            ("HOME", &user),
+        ],
+    )
+    .await;
+    let services = [
+        "fs",
+        "attachments",
+        "credentials",
+        "storage",
+        "sessionPersistence",
+        "skills",
+    ];
+    let mut rows: Vec<Value> = serde_json::from_str(
+        &std::fs::read_to_string(dsh_dir().join("host-services.json")).unwrap(),
+    )
+    .unwrap();
+    rows.extend([
+        json!({ "id": "system-prompt", "name": "@deepseek-ai/dsh-system-prompt" }),
+        json!({ "id": "tools", "name": "@deepseek-ai/dsh-tools" }),
+        json!({ "id": "adapter", "name": dsh_dir().join("dsh-tools-adapter.ts") }),
+        json!({ "id": "read-key", "name": reader }),
+        json!({
+            "id": "probe-services",
+            "name": dsh_dir().join("probe-services.ts"),
+            "config": { "names": services, "out": services_out, "waitMs": 1000 },
+        }),
+    ]);
+    host.load(Value::Array(rows)).await;
+    let report: Value =
+        serde_json::from_str(&wait_file(&services_out, |t| !t.is_empty()).await).unwrap();
+    assert_eq!(report["missing"], json!([]), "{report}");
+    assert_eq!(
+        report["present"].as_array().map(Vec::len),
+        Some(services.len()),
+        "{report}"
+    );
+    assert_eq!(
+        wait_file(&key_out, |t| !t.is_empty()).await,
+        "from-the-given-home file",
+        "the key comes from the given DSH_HOME"
+    );
+    let created: Vec<_> = std::fs::read_dir(&user)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(created.is_empty(), "nothing under HOME: {created:?}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// A dsh plugin that needs DSH's host services (most popular ones do) runs
+/// and reaches the agent only with `host-services.json` loaded; without it
+/// the plugin never starts and its tool is never offered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dsh_plugin_needing_host_services_runs_only_with_them() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    for with_services in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("dsh-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let credentials = home.join(".credentials.yaml");
+        std::fs::write(
+            &credentials,
+            "version: 1\nrefs:\n  YOAGENT_TEST_KEY: from-dsh-home\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &credentials,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let agents = dir.path().join("agents");
+        let ready = dir.path().join("ready.txt");
+        let host = host_with(
+            &runtime,
+            None,
+            &[("DSH_HOME", &home), ("DSH_AGENTS_HOME", &agents)],
+        )
+        .await;
+        let mut rows: Vec<Value> = if with_services {
+            serde_json::from_str(
+                &std::fs::read_to_string(dsh_dir().join("host-services.json")).unwrap(),
+            )
+            .unwrap()
+        } else {
+            Vec::new()
+        };
+        rows.extend([
+            json!({ "id": "system-prompt", "name": "@deepseek-ai/dsh-system-prompt" }),
+            json!({ "id": "tools", "name": "@deepseek-ai/dsh-tools" }),
+            json!({
+                "id": "needs-services",
+                "name": dsh_dir().join("fixture-needs-services.ts"),
+                "config": { "ready": ready },
+            }),
+            json!({ "id": "adapter", "name": dsh_dir().join("dsh-tools-adapter.ts") }),
+        ]);
+        host.load(Value::Array(rows)).await;
+        if with_services {
+            wait_file(&ready, |t| t == "started").await;
+        } else {
+            // Long enough for a plugin with its services to have started.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(
+                !ready.exists(),
+                "without the host services it must not start"
+            );
+        }
+        let (agent, _) = agent(vec![call("fixture_services", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        let (_, text, is_error) = &results[0];
+        if with_services {
+            assert!(
+                !is_error && text == "credentials: from-dsh-home",
+                "{results:?}"
+            );
+        } else {
+            assert!(*is_error && text.contains("not found"), "{results:?}");
         }
         host.root.shutdown().await.unwrap();
     }
