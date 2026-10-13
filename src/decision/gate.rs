@@ -324,8 +324,7 @@ impl ToolGate {
                 );
                 return ToolDecision::Deny(format!(
                     "Tool gate: this call's arguments are too large to evaluate ({chars} \
-                     characters even with every long string cut to {MIN_KEPT_CHARS}), so it \
-                     was not run. The gate fails closed; split the work into smaller calls or \
+                     characters at the shortest the gate may make them), so it was not run. The gate fails closed; split the work into smaller calls or \
                      ask the user."
                 ));
             }
@@ -483,8 +482,8 @@ fn fit_arguments(
             return Err(Unfit::FullView { argument, chars });
         }
     }
-    let chars = serde_json::to_string(&cut(args, &[], MIN_KEPT_CHARS).arguments)
-        .map_or(usize::MAX, |s| s.chars().count());
+    // The smallest view the gate may send, for the denial to report.
+    let chars = json_chars(&cut(args, full_views, MIN_KEPT_CHARS).arguments);
     Err(Unfit::TooLarge { chars })
 }
 
@@ -559,8 +558,14 @@ fn collect_full_views(
     });
 }
 
+/// Characters `v` takes serialized.
+fn json_chars(v: &impl serde::Serialize) -> usize {
+    serde_json::to_string(v).map_or(usize::MAX, |s| s.chars().count())
+}
+
 /// `args` with every string outside `full_views` longer than `cap` cut to
-/// its head and tail.
+/// its head and tail — except where the cut, with its marker, would not
+/// make the arguments smaller.
 fn cut(args: &Value, full_views: &[&str], cap: usize) -> View {
     fn go(
         v: &Value,
@@ -574,12 +579,21 @@ fn cut(args: &Value, full_views: &[&str], cap: usize) -> View {
         match v {
             Value::String(s) if !here => {
                 let len = s.chars().count();
-                if len > cap {
-                    omitted.push((pointer.clone(), len - 2 * (cap / 2)));
-                    Value::String(truncate_middle(s, cap))
-                } else {
-                    v.clone()
+                if len <= cap {
+                    return v.clone();
                 }
+                // Only a cut that shrinks the arguments — what the budget
+                // measures: the marker can outweigh the few characters cut
+                // from a string just over `cap`. In serialized characters;
+                // every removed character is at least a byte and the marker
+                // is ASCII, so it shrinks the bytes (the token estimate) too.
+                let chars = len - 2 * (cap / 2);
+                let shortened = truncate_middle(s, cap);
+                if json_chars(&shortened) >= json_chars(s) {
+                    return v.clone();
+                }
+                omitted.push((pointer.clone(), chars));
+                Value::String(shortened)
             }
             Value::Array(items) => Value::Array(
                 items
@@ -712,6 +726,36 @@ mod tests {
         assert_eq!(view.omitted[0].0, "/long");
         let len = serde_json::to_string(&view.arguments).unwrap().len();
         assert!((2_900..=3_000).contains(&len), "{len}");
+    }
+
+    #[test]
+    fn a_cut_never_grows_the_arguments() {
+        // Strings around the cap (where the marker outweighs the cut),
+        // escapes that shrink when cut, and non-ASCII text.
+        let args = json!({
+            "near": "n".repeat(401),
+            "escaped": "\n".repeat(600),
+            "cjk": "汉".repeat(450),
+            "long": "l".repeat(5_000),
+            "nested": [{"deep": "d".repeat(430)}],
+        });
+        let whole = serde_json::to_string(&args).unwrap();
+        let (chars, bytes) = (whole.chars().count(), whole.len());
+        for cap in [MIN_KEPT_CHARS, 401, 420, 450, 1_000, 4_999] {
+            let view = cut(&args, &[], cap);
+            let s = serde_json::to_string(&view.arguments).unwrap();
+            assert!(s.chars().count() <= chars, "cap {cap}: chars grew");
+            assert!(s.len() <= bytes, "cap {cap}: bytes grew");
+            // Every listed cut really happened, and only those.
+            for (pointer, _) in &view.omitted {
+                let shown = view.arguments.pointer(pointer).unwrap().as_str().unwrap();
+                assert!(shown.contains("[truncated "), "{pointer}");
+            }
+        }
+        // Just over the cap: left whole, not listed.
+        let view = cut(&args, &[], 400);
+        assert_eq!(view.arguments["near"], args["near"]);
+        assert!(view.omitted.iter().all(|(p, _)| p != "/near"));
     }
 
     #[test]
