@@ -74,8 +74,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
 
+      - name: Install ripgrep
+        # tests/search_config_test.rs runs the search tool against a real `rg`
+        # (a user's ripgrep config must not reach it, #315). With
+        # YOAGENT_REQUIRE_RG set below it fails rather than skips without `rg`.
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install ripgrep; else sudo apt-get update -q && sudo apt-get install -y ripgrep; fi
+          rg --version
+
       - name: Test
         run: cargo test --all-features
+        env:
+          YOAGENT_REQUIRE_RG: "1"
 
       - name: Build
         run: cargo build --all-features
