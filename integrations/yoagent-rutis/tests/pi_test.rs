@@ -924,6 +924,79 @@ async fn a_pi_tool_runs_only_the_arguments_its_policies_judged() {
     host.root.shutdown().await.unwrap();
 }
 
+/// A pi tool's `offered_by` names the adapter's handler and, as its source,
+/// the extension file that registered the tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pi_tool_is_offered_by_its_extension_file() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let host = host(&runtime).await;
+    // Configured relative to the adapter's `cwd`: the source is the file pi
+    // resolved, not that spelling.
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = extension(
+        dir.path(),
+        "owned.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_echo', label: 'echo', description: 'echoes', parameters: Type.Object({}),
+    async execute() {
+      return { content: [{ type: 'text', text: 'echo' }], details: undefined }
+    },
+  })
+}
+"#,
+    );
+    host.load(adapter_row(
+        json!({ "extensions": ["./owned.ts"], "cwd": dir.path() }),
+    ))
+    .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let later = host
+        .root
+        .plugin(plugin(handler("later").with_before_tool(move |call| {
+            record
+                .lock()
+                .unwrap()
+                .push((call.tool.clone(), call.offered_by.clone()));
+            ToolDecision::Allow
+        })));
+    wait_active(&later).await;
+    let (agent, _) = agent(vec![
+        calls(&[
+            ("pi_echo", json!({})),
+            ("read_file", json!({"path": "nowhere.txt"})),
+        ]),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tools(vec![Box::new(ReadFileTool::new())])
+        .with_extension(host.bridge.extension());
+    run(&mut agent, "go").await;
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let (tool, owner) = &seen[0];
+    assert_eq!(tool, "pi_echo");
+    let owner = owner.as_ref().expect("a pi tool is offered by the adapter");
+    assert_eq!(owner.handler(), "pi-extensions");
+    let source = owner.source().expect("its extension file");
+    assert!(Path::new(source).is_absolute(), "{source}");
+    assert_eq!(
+        std::fs::canonicalize(source).unwrap(),
+        std::fs::canonicalize(&fixture).unwrap()
+    );
+    assert_eq!(
+        seen[1],
+        ("read_file".to_string(), None),
+        "the agent's own tool"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deciding_event_registered_mid_run_stops_that_run() {
     let Some(runtime) = node_runtime() else {
