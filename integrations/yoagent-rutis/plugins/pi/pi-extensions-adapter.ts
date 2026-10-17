@@ -30,7 +30,8 @@
 //                           with `parentToolCallId`, results through
 //                           `tool_result`; never rejects); yoagent's own tools
 //                           are not reachable from it. `ctx.tools` lists the
-//                           callable ones.
+//                           callable ones. Config `nestedCalls` narrows both
+//                           (`own-extension`, `off`).
 //                           A tool that overrides one of pi's built-ins
 //                           (`read`, `edit`, ...) makes the adapter deny
 //                           yoagent's counterpart (`read_file`, ...), so the
@@ -151,6 +152,13 @@ export interface Config {
   allowUnmapped?: string[]
   /** Fail loading when an extension registers anything else that does not map. */
   strict?: boolean
+  /**
+   * Which tools a pi tool may call through `ctx.executeTool`. Nested calls are judged by pi's
+   * `tool_call` handlers only, never by the host's per-call policies, so a host that trusts tools
+   * per extension narrows them: `"any"` (default, as pi), `"own-extension"` (only tools whose winning
+   * registration is the calling tool's own extension's), `"off"`. A refused call is an error result to the caller.
+   */
+  nestedCalls?: 'any' | 'own-extension' | 'off'
 }
 
 /**
@@ -498,6 +506,7 @@ export default definePlugin<Config>({
       withoutBuiltins: { type: 'array', items: { type: 'string' } },
       allowUnmapped: { type: 'array', items: { type: 'string' } },
       strict: { type: 'boolean' },
+      nestedCalls: { type: 'string', enum: ['any', 'own-extension', 'off'] },
     },
   },
   async apply(ctx, config) {
@@ -515,6 +524,10 @@ export default definePlugin<Config>({
     const names = new Map(Object.entries({ ...TOOL_NAMES, ...config.toolNames }))
     const withoutBuiltins = new Set(config.withoutBuiltins ?? [])
     const allowUnmapped = new Set(config.allowUnmapped ?? [])
+    const nestedCalls = config.nestedCalls ?? 'any'
+    if (!['any', 'own-extension', 'off'].includes(nestedCalls)) {
+      throw new Error(`nestedCalls must be "any", "own-extension" or "off", not ${JSON.stringify(nestedCalls)}`)
+    }
 
     const { SessionManager } = await import('@earendil-works/pi-coding-agent')
     const { validateToolArguments } = await import('@earendil-works/pi-ai')
@@ -621,6 +634,7 @@ export default definePlugin<Config>({
       args: unknown,
       signal: AbortSignal,
       depth: number,
+      caller: string | undefined,
     ): Promise<Outcome> => {
       const failed = (text: string, input: unknown = args): Outcome => ({
         toolCall: { id, name, arguments: input },
@@ -631,6 +645,16 @@ export default definePlugin<Config>({
       checkShadowing(false)
       if (refusal) return failed(refusal)
       if (depth >= 8) return failed('nested tool calls are limited to 8 levels')
+      // A tool still running after its run ended (a timer, a detached promise).
+      if (!snapshots.has(runId)) return failed(`run ${runId} has ended; nested tool calls are no longer possible`)
+      // Refused before any lookup or foreign code: the host's scope, reported to the host, since
+      // nested calls never reach its per-call policies.
+      const refused =
+        nestedCalls === 'off' || callableIn(runId).has(name) ? nestedRefusal(runId, caller, name) : undefined
+      if (refused) {
+        report('info', `[pi] nested call ${parentId} -> ${name} refused: ${refused}`)
+        return failed(refused)
+      }
       // From the run's snapshot, like a top-level call: a name registered since never takes over.
       const tool = callableIn(runId).get(name)
       if (!tool) return failed(`Tool ${name} not found (yoagent's own tools cannot be called from a pi tool)`)
@@ -660,7 +684,7 @@ export default definePlugin<Config>({
       const started = performance.now()
       let out: { content?: Block[]; details?: unknown; isError?: boolean }
       try {
-        out = await tool.execute(id, input, signal, undefined, toolContext(signal, runId, id, depth + 1))
+        out = await tool.execute(id, input, signal, undefined, toolContext(signal, runId, id, depth + 1, sourceIn(runId, name)))
       } catch (error) {
         // As pi: a throw is an error result, and it still goes through the tool_result handlers.
         out = { content: [{ type: 'text', text: message(error) }], details: {}, isError: true }
@@ -696,16 +720,17 @@ export default definePlugin<Config>({
     }
 
     /** A tool's `ctx`: the extension context, plus `tools` and `executeTool` for nested calls. */
-    const toolContext = (signal: AbortSignal, runId: string, callId: string, depth = 0) => {
+    const toolContext = (signal: AbortSignal, runId: string, callId: string, depth: number, caller: string | undefined) => {
       let nested = 0
       return {
         ...context(signal),
         get tools() {
-          // The run's frozen copies: a tool cannot swap another's `execute` through them.
-          return [...callableIn(runId).values()]
+          // The run's frozen copies (a tool cannot swap another's `execute` through them), only
+          // those `nestedCalls` lets this tool call.
+          return [...callableIn(runId)].filter(([name]) => !nestedRefusal(runId, caller, name)).map(([, tool]) => tool)
         },
         executeTool: (name: string, args: unknown, options?: { signal?: AbortSignal }) =>
-          executeNested(runId, callId, `${callId}/${++nested}`, name, args, options?.signal ?? signal, depth),
+          executeNested(runId, callId, `${callId}/${++nested}`, name, args, options?.signal ?? signal, depth, caller),
       }
     }
 
@@ -982,16 +1007,30 @@ export default definePlugin<Config>({
     const terminated = new Map<string, string>()
     // The arguments the policies approved, per run and call: `call_tool` runs only these.
     const judged = new Map<string, string>()
-    // Per run, as its `tools` saw them: the pi tools it was offered, and the ones its pi tools may
-    // call through `ctx.executeTool`. Its calls, top-level and nested, are judged and run against
+    // Per run, as its `tools` saw them: the pi tools it was offered, the ones its pi tools may
+    // call through `ctx.executeTool`, and the extension file that registered each (what
+    // `nestedCalls` compares). Its calls, top-level and nested, are judged and run against
     // these only, so a name registered again later (an extension earlier in the list, from an
     // event handler or a timer) never takes over a call, and `source` names what runs. Frozen
     // shallow copies: `ctx.tools` hands them to running tools, which must not swap an `execute`.
-    const snapshots = new Map<string, { offered: Map<string, PiTool>; callable: Map<string, PiTool> }>()
+    const snapshots = new Map<
+      string,
+      { offered: Map<string, PiTool>; callable: Map<string, PiTool>; sources: Map<string, string> }
+    >()
     const frozen = (tools: Map<string, PiTool>) =>
       new Map([...tools].map(([name, tool]) => [name, Object.freeze({ ...tool }) as PiTool]))
     const offeredIn = (runId: string) => snapshots.get(runId)?.offered ?? new Map<string, PiTool>()
     const callableIn = (runId: string) => snapshots.get(runId)?.callable ?? new Map<string, PiTool>()
+    /** The extension file that registered `name`, as the run's `tools` saw it. */
+    const sourceIn = (runId: string, name: string) => snapshots.get(runId)?.sources.get(name)
+    /** Why `nestedCalls` refuses a call from a tool of `caller` to `name`, if it does. */
+    const nestedRefusal = (runId: string, caller: string | undefined, name: string) => {
+      if (nestedCalls === 'off') return `nested tool calls are turned off by the host (nestedCalls: "off")`
+      if (nestedCalls === 'own-extension' && (caller === undefined || sourceIn(runId, name) !== caller)) {
+        return `${name} belongs to another extension; the host allows nested calls only within the calling tool's own extension (nestedCalls: "own-extension")`
+      }
+      return undefined
+    }
     const callKey = (call: ToolCall) => `${call.run_id}/${call.call_id}`
 
     const startNote = async (prompt: string, signal: AbortSignal) => {
@@ -1063,7 +1102,7 @@ export default definePlugin<Config>({
           if (refusal) return []
           const paths = registeredBy()
           const tools = frozen(available())
-          snapshots.set(run.run_id, { offered: tools, callable: frozen(callable()) })
+          snapshots.set(run.run_id, { offered: tools, callable: frozen(callable()), sources: paths })
           return [...tools.values()].map((tool) => ({
             name: tool.name,
             // The extension file that registered it: a host's policy may trust a tool by it.
@@ -1089,7 +1128,7 @@ export default definePlugin<Config>({
             }
           }
           try {
-            const out = await tool.execute(call.call_id, call.args, call.signal, undefined, toolContext(call.signal, call.run_id, call.call_id))
+            const out = await tool.execute(call.call_id, call.args, call.signal, undefined, toolContext(call.signal, call.run_id, call.call_id, 0, sourceIn(call.run_id, call.tool)))
             if (out.isError === true) return { text: text(out.content), details: out.details ?? null, is_error: true }
             return { content: blocks(out.content), details: out.details ?? null }
           } catch (error) {

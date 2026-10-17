@@ -1180,6 +1180,193 @@ export default function (pi) {{
     host.root.shutdown().await.unwrap();
 }
 
+/// `nestedCalls` narrows what a pi tool may call through `ctx.executeTool`:
+/// `"any"` (pi's behaviour), `"own-extension"` (only its own extension's
+/// tools), `"off"`; a refused call is an error result the calling tool sees,
+/// and `ctx.tools` lists only what it may call.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_calls_follow_the_host_s_scope() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'alpha_helper', label: 'h', description: 'h', parameters: Type.Object({}),
+    exposure: 'deferred',
+    async execute() { return { content: [{ type: 'text', text: 'alpha helper' }], details: undefined } },
+  })
+  pi.registerTool({
+    name: 'alpha_runner', label: 'r', description: 'r', parameters: Type.Object({}),
+    async execute(_id, _args, _signal, _update, ctx) {
+      const said = []
+      for (const name of ['alpha_helper', 'beta_helper']) {
+        const out = await ctx.executeTool(name, {})
+        said.push(`${name}: ${out.isError ? 'refused' : out.result.content[0].text}`)
+      }
+      const listed = ctx.tools.map((t) => t.name).filter((n) => n.endsWith('_helper')).sort()
+      said.push(`listed: ${listed.join(' ') || 'none'}`)
+      return { content: [{ type: 'text', text: said.join('; ') }], details: undefined }
+    },
+  })
+}
+"#,
+    );
+    let beta = extension(
+        dir.path(),
+        "beta.ts",
+        r#"import { Type } from 'typebox'
+export default function (pi) {
+  pi.registerTool({
+    name: 'beta_helper', label: 'h', description: 'h', parameters: Type.Object({}),
+    exposure: 'deferred',
+    async execute() { return { content: [{ type: 'text', text: 'beta helper' }], details: undefined } },
+  })
+}
+"#,
+    );
+    for (mode, want) in [
+        (
+            None,
+            "alpha_helper: alpha helper; beta_helper: beta helper; listed: alpha_helper beta_helper",
+        ),
+        (
+            Some("own-extension"),
+            "alpha_helper: alpha helper; beta_helper: refused; listed: alpha_helper",
+        ),
+        (
+            Some("off"),
+            "alpha_helper: refused; beta_helper: refused; listed: none",
+        ),
+    ] {
+        let mut config = json!({ "extensions": [&alpha, &beta] });
+        if let Some(mode) = mode {
+            config["nestedCalls"] = json!(mode);
+        }
+        let host = host(&runtime).await;
+        host.load(adapter_row(config)).await;
+        let (agent, _) = agent(vec![call("alpha_runner", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(
+            results,
+            vec![("alpha_runner".into(), want.to_string(), false)],
+            "{mode:?}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+
+    // A value it does not know refuses the load.
+    let host = host(&runtime).await;
+    let failure = host
+        .try_load(adapter_row(
+            json!({ "extensions": [&alpha], "nestedCalls": "some" }),
+        ))
+        .await;
+    assert!(failure.contains("nestedCalls"), "{failure}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// Under `"own-extension"`, a name two extensions registered belongs to the
+/// winning (first) registration — the one whose code would run — in both
+/// load orders; and under `"off"` an unknown name says the host turned nested
+/// calls off.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_extension_follows_the_winning_registration() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let helper = |who: &str| {
+        format!(
+            r#"pi.registerTool({{
+    name: 'shared_helper', label: 'h', description: 'h', parameters: Type.Object({{}}),
+    exposure: 'deferred',
+    async execute() {{ return {{ content: [{{ type: 'text', text: '{who} shared' }}], details: undefined }} }},
+  }})"#
+        )
+    };
+    let alpha = extension(
+        dir.path(),
+        "alpha.ts",
+        &format!(
+            r#"import {{ Type }} from 'typebox'
+export default function (pi) {{
+  {}
+  pi.registerTool({{
+    name: 'alpha_runner', label: 'r', description: 'r', parameters: Type.Object({{}}),
+    async execute(_id, _args, _signal, _update, ctx) {{
+      const said = []
+      for (const name of ['shared_helper', 'nope_helper']) {{
+        const out = await ctx.executeTool(name, {{}})
+        said.push(`${{name}}: ${{out.result.content[0].text}}`)
+      }}
+      said.push(`listed: ${{ctx.tools.map((t) => t.name).filter((n) => n.endsWith('_helper')).join(' ') || 'none'}}`)
+      return {{ content: [{{ type: 'text', text: said.join('; ') }}], details: undefined }}
+    }},
+  }})
+}}
+"#,
+            helper("alpha")
+        ),
+    );
+    let beta = extension(
+        dir.path(),
+        "beta.ts",
+        &format!(
+            "import {{ Type }} from 'typebox'\nexport default function (pi) {{\n  {}\n}}\n",
+            helper("beta")
+        ),
+    );
+    for (order, mode, want) in [
+        (
+            [&beta, &alpha],
+            "own-extension",
+            &[
+                "shared_helper: shared_helper belongs to another extension",
+                "nope_helper: Tool nope_helper not found",
+                "listed: none",
+            ][..],
+        ),
+        (
+            [&alpha, &beta],
+            "own-extension",
+            &[
+                "shared_helper: alpha shared",
+                "nope_helper: Tool nope_helper not found",
+                "listed: shared_helper",
+            ][..],
+        ),
+        (
+            [&alpha, &beta],
+            "off",
+            &[
+                "shared_helper: nested tool calls are turned off",
+                "nope_helper: nested tool calls are turned off",
+                "listed: none",
+            ][..],
+        ),
+    ] {
+        let host = host(&runtime).await;
+        host.load(adapter_row(
+            json!({ "extensions": order, "nestedCalls": mode }),
+        ))
+        .await;
+        let (agent, _) = agent(vec![call("alpha_runner", json!({})), text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(results.len(), 1, "{results:?}");
+        for part in want {
+            assert!(results[0].1.contains(part), "{mode} {part:?}: {results:?}");
+        }
+        host.root.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deciding_event_registered_mid_run_stops_that_run() {
     let Some(runtime) = node_runtime() else {
