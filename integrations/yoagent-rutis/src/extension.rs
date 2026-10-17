@@ -70,7 +70,7 @@ use crate::handler::{
     join_notes, llm_messages, EventSink, Input, Messages, RunInfo, Stop, ToolCall, Turn,
 };
 use crate::host::{Host, NOT_RUNNING};
-use crate::registry::{LiveTool, Registered, Registry};
+use crate::registry::{LiveTool, Outcome, Registered, Registry};
 
 /// Default bound on one handler's `before_tool`, `after_tool` and `on_stop`
 /// call (the tool call is denied / the result withheld / the handler skipped
@@ -321,7 +321,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// it panics, abandoned past `limit` or when its plugin unloads mid-call.
 async fn call<T>(
     h: &Registered,
-    hook: &str,
+    hook: &'static str,
     limit: Option<Duration>,
     fut: impl std::future::Future<Output = Result<T, ExtensionError>>,
 ) -> Result<T, Missed> {
@@ -331,6 +331,18 @@ async fn call<T>(
             h.name
         )));
     }
+    let timer = h.time(hook);
+    let result = call_timed(h, hook, limit, fut).await;
+    timer.done(Outcome::answered(result.is_ok()));
+    result
+}
+
+async fn call_timed<T>(
+    h: &Registered,
+    hook: &'static str,
+    limit: Option<Duration>,
+    fut: impl std::future::Future<Output = Result<T, ExtensionError>>,
+) -> Result<T, Missed> {
     let guarded = AssertUnwindSafe(fut).catch_unwind();
     let raced = async {
         tokio::select! {
@@ -472,6 +484,7 @@ impl RunHooks for RunState {
                 tools.push(Arc::new(LiveTool {
                     inner: tool,
                     gate: h.gate.clone(),
+                    handler: h.clone(),
                 }) as Arc<dyn AgentTool>);
             } else {
                 tracing::warn!(
@@ -728,16 +741,27 @@ impl RunHooks for RunState {
             if observer.off.load(Ordering::Relaxed) || !observer.handler.gate.is_available() {
                 continue;
             }
+            let timer = observer.handler.time("on_event");
             let sent = std::panic::catch_unwind(AssertUnwindSafe(|| observer.sink.send(event)));
             let failed = match sent {
                 // A Rust handler panicked.
-                Err(payload) => Some(format!(
-                    "plugin handler `{}` panicked in `on_event`: {} (not called again this run)",
-                    observer.handler.name,
-                    panic_text(&*payload)
-                )),
+                Err(payload) => {
+                    timer.done(Outcome::Failed);
+                    Some(format!(
+                        "plugin handler `{}` panicked in `on_event`: {} (not called again this run)",
+                        observer.handler.name,
+                        panic_text(&*payload)
+                    ))
+                }
                 // A language plugin's delivery failed (its message says how).
-                Ok(()) => observer.sink.failure(),
+                Ok(taken) => {
+                    if taken {
+                        timer.done(Outcome::Ok);
+                    } else {
+                        timer.discard();
+                    }
+                    observer.sink.failure()
+                }
             };
             if let Some(why) = failed {
                 observer.off.store(true, Ordering::Relaxed);

@@ -28,7 +28,9 @@
 //! generation's handler and gets those errors; the new generation's handler
 //! serves the next run. The bridge never rebinds a run to a newer generation.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rutis::{CordisError, Ctx, Disposer, Effect};
 use tokio_util::sync::CancellationToken;
@@ -55,6 +57,7 @@ use crate::handler::{Handler, HandlerImpl, Hooks};
 #[derive(Default)]
 pub struct Registry {
     inner: Mutex<Inner>,
+    timings: Arc<Timings>,
 }
 
 #[derive(Default)]
@@ -111,9 +114,195 @@ impl Gate {
 #[derive(Clone)]
 pub(crate) struct Registered {
     pub(crate) name: Arc<str>,
+    pub(crate) owner: Arc<str>,
     pub(crate) handler: Arc<dyn HandlerImpl>,
     pub(crate) hooks: Hooks,
     pub(crate) gate: Gate,
+    pub(crate) timings: Arc<Timings>,
+}
+
+impl Registered {
+    /// Time one call of `hook` on this handler, from now until the
+    /// returned timer's `done` (or its drop: a call yoagent abandoned).
+    pub(crate) fn time(&self, hook: &'static str) -> Timer {
+        self.timer(hook, None)
+    }
+
+    /// Time one execution of the plugin tool `tool`.
+    pub(crate) fn time_tool(&self, tool: &str) -> Timer {
+        self.timer("tool", Some(tool.to_owned()))
+    }
+
+    fn timer(&self, hook: &'static str, tool: Option<String>) -> Timer {
+        Timer {
+            key: Some(Key {
+                handler: self.name.clone(),
+                owner: self.owner.clone(),
+                hook,
+                tool,
+            }),
+            timings: self.timings.clone(),
+            start: Instant::now(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Key {
+    handler: Arc<str>,
+    owner: Arc<str>,
+    hook: &'static str,
+    tool: Option<String>,
+}
+
+/// A hook call being timed ([`Registered::time`]). Dropped before `done`,
+/// it records the call with the time it had taken: as failed while a panic
+/// unwinds through it (a Rust plugin tool that panicked), else as
+/// cancelled (the call abandoned by yoagent: a hook of a cancelled run, a
+/// `finish` cut off by yoagent's limit).
+pub(crate) struct Timer {
+    key: Option<Key>,
+    timings: Arc<Timings>,
+    start: Instant,
+}
+
+impl Timer {
+    /// The call ended, as `outcome` says.
+    pub(crate) fn done(mut self, outcome: Outcome) {
+        if let Some(key) = self.key.take() {
+            self.timings.record(key, self.start.elapsed(), outcome);
+        }
+    }
+
+    /// Nothing was called after all (an event the handler does not take).
+    pub(crate) fn discard(mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let outcome = if std::thread::panicking() {
+                Outcome::Failed
+            } else {
+                Outcome::Cancelled
+            };
+            self.timings.record(key, self.start.elapsed(), outcome);
+        }
+    }
+}
+
+/// How a timed call ended.
+#[derive(Clone, Copy)]
+pub(crate) enum Outcome {
+    Ok,
+    Failed,
+    Cancelled,
+}
+
+impl Outcome {
+    /// `Ok` when the call answered, else `Failed`.
+    pub(crate) fn answered(ok: bool) -> Self {
+        if ok {
+            Outcome::Ok
+        } else {
+            Outcome::Failed
+        }
+    }
+}
+
+/// The time one handler spent in one kind of hook (or one of its tools),
+/// as the agent waited for it: measured at the bridge, around each call, so
+/// for a language plugin it includes the round trip to its runtime.
+/// Cumulative since the bridge was installed, or since the last
+/// [`Registry::take_timings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HookTiming {
+    /// The handler's name.
+    pub handler: String,
+    /// The plugin that registered it.
+    pub owner: String,
+    /// `tools`, `on_input`, `before_model`, `before_tool`, `after_tool`,
+    /// `on_stop`, `on_event`, `finish`, or `tool` (an execution of one of
+    /// the handler's tools, named in [`tool`](Self::tool)). For a language
+    /// plugin, `on_event` is the time to queue an event it subscribed to:
+    /// the plugin handles it later, off the agent's path; events it does not
+    /// take are not counted.
+    pub hook: &'static str,
+    /// The tool, when `hook` is `tool`.
+    pub tool: Option<String>,
+    /// Calls made (answered, failed and cancelled).
+    pub calls: u64,
+    /// Calls that did not answer: an error, a panic, a timeout, or the
+    /// plugin unloading during the call. For `tool`, any error the tool
+    /// returned other than [`ToolError::Cancelled`](yoagent::ToolError), and
+    /// a panic. For `on_event`, a panic in a Rust handler only (a language
+    /// plugin's late delivery failure is logged and switches its events
+    /// off, as before).
+    pub failed: u64,
+    /// Calls ended by cancellation before they answered: a hook abandoned
+    /// when its run was cancelled, a `finish` cut off by yoagent's 5 s
+    /// limit (with the default turn timeout, also 5 s, either limit can
+    /// end it first: a slow `finish` may count as failed instead), or a
+    /// tool that returned [`ToolError::Cancelled`](yoagent::ToolError).
+    /// Their time up to then is in `total` and `max`.
+    pub cancelled: u64,
+    /// Time spent in all of them.
+    pub total: Duration,
+    /// The longest one.
+    pub max: Duration,
+}
+
+/// Every handler's [`HookTiming`]s, kept for the whole registry.
+#[derive(Default)]
+pub(crate) struct Timings(Mutex<BTreeMap<Key, Stat>>);
+
+#[derive(Default, Clone, Copy)]
+struct Stat {
+    calls: u64,
+    failed: u64,
+    cancelled: u64,
+    total: Duration,
+    max: Duration,
+}
+
+impl Timings {
+    fn record(&self, key: Key, took: Duration, outcome: Outcome) {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let stat = map.entry(key).or_default();
+        stat.calls += 1;
+        match outcome {
+            Outcome::Ok => {}
+            Outcome::Failed => stat.failed += 1,
+            Outcome::Cancelled => stat.cancelled += 1,
+        }
+        stat.total += took;
+        stat.max = stat.max.max(took);
+    }
+
+    fn list(&self, reset: bool) -> Vec<HookTiming> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let out = map
+            .iter()
+            .map(|(k, s)| HookTiming {
+                handler: k.handler.to_string(),
+                owner: k.owner.to_string(),
+                hook: k.hook,
+                tool: k.tool.clone(),
+                calls: s.calls,
+                failed: s.failed,
+                cancelled: s.cancelled,
+                total: s.total,
+                max: s.max,
+            })
+            .collect();
+        if reset {
+            map.clear();
+        }
+        out
+    }
 }
 
 /// A registered handler, for diagnostics.
@@ -280,11 +469,30 @@ impl Registry {
             .filter(|e| e.gate.is_available())
             .map(|e| Registered {
                 name: e.name.as_str().into(),
+                owner: e.owner.as_str().into(),
                 hooks: e.handler.hooks(),
                 handler: e.handler.clone(),
                 gate: e.gate.clone(),
+                timings: self.timings.clone(),
             })
             .collect()
+    }
+
+    /// The time each handler spent in each kind of hook, as the agent
+    /// waited for it, sorted by handler, owner and hook: cumulative since
+    /// the bridge was installed or the last [`take_timings`](Self::take_timings).
+    /// Cheap to keep on (two clock reads and a short lock per call); for a
+    /// whole-session view.
+    pub fn timings(&self) -> Vec<HookTiming> {
+        self.timings.list(false)
+    }
+
+    /// [`timings`](Self::timings), and start counting from zero: called at a
+    /// run's end, the figures of that run alone (with runs one at a time;
+    /// with the bridge as a tree extension, the sub-agent runs it served
+    /// included).
+    pub fn take_timings(&self) -> Vec<HookTiming> {
+        self.timings.list(true)
     }
 
     /// The handlers a run starting now would get, in registration order.
@@ -314,6 +522,8 @@ impl Registry {
 pub(crate) struct LiveTool {
     pub(crate) inner: Arc<dyn AgentTool>,
     pub(crate) gate: Gate,
+    /// The handler that offered it, to time its executions.
+    pub(crate) handler: Registered,
 }
 
 impl LiveTool {
@@ -347,12 +557,20 @@ impl AgentTool for LiveTool {
         if !self.gate.is_available() {
             return Err(self.gone());
         }
-        tokio::select! {
+        // A panic unwinds through `timer`, which records it as failed.
+        let timer = self.handler.time_tool(self.inner.name());
+        let result = tokio::select! {
             result = self.inner.execute(params, ctx) => result,
             _ = self.gate.gone() => Err(yoagent::ToolError::Failed(format!(
                 "tool `{}` failed: its plugin unloaded during the call",
                 self.inner.name()
             ))),
-        }
+        };
+        timer.done(match &result {
+            Ok(_) => Outcome::Ok,
+            Err(yoagent::ToolError::Cancelled) => Outcome::Cancelled,
+            Err(_) => Outcome::Failed,
+        });
+        result
     }
 }

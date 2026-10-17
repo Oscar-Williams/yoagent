@@ -969,13 +969,13 @@ impl RemoteEvents {
 }
 
 impl EventSink for RemoteEvents {
-    fn send(&self, event: &AgentEvent) {
+    fn send(&self, event: &AgentEvent) -> bool {
         if self.failure().is_some() {
-            return;
+            return false;
         }
         let kind = event_type(event);
         if !self.filter.contains(&kind) {
-            return;
+            return false;
         }
         let mut json = to_json(event);
         if let (Some(fields), Json::Object(run)) = (json.as_object_mut(), to_json(&self.run)) {
@@ -983,15 +983,21 @@ impl EventSink for RemoteEvents {
         }
         use tokio::sync::mpsc::error::TrySendError;
         match self.tx.try_send(Delivery::Event(json)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => record_failure(
-                &self.failed,
-                format!(
-                    "plugin handler `{}` fell {EVENT_QUEUE} events behind in `on_event` (not called again this run)",
-                    self.name
-                ),
-            ),
-            Err(TrySendError::Closed(_)) => self.ended(),
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                record_failure(
+                    &self.failed,
+                    format!(
+                        "plugin handler `{}` fell {EVENT_QUEUE} events behind in `on_event` (not called again this run)",
+                        self.name
+                    ),
+                );
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.ended();
+                false
+            }
         }
     }
 
@@ -1565,7 +1571,10 @@ mod tests {
                 }
             }),
         );
-        sink.send(&tool_end());
+        // Taken: an event it subscribed to. Not taken: one it did not, which
+        // the timings then do not count.
+        assert!(sink.send(&tool_end()));
+        assert!(!sink.send(&AgentEvent::AgentStart));
         sink.flush().await;
         assert_eq!(delivered.lock().unwrap().len(), 1);
         assert_eq!(sink.failure(), None);
@@ -1582,5 +1591,11 @@ mod tests {
         assert_eq!(fields.len(), 3);
         // Anything else is passed as it is.
         assert!(matches!(with_signal(json!("text")), Value::Data(t) if t == "text"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sink_whose_delivery_ended_takes_nothing() {
+        let sink = sink(Breaks::TaskDies, &RunInfo::new("run-1"));
+        assert!(!sink.send(&tool_end()));
     }
 }
