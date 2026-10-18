@@ -4,6 +4,12 @@ All notable changes to `yoagent` are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### yoagent-rutis
+
+- **rutis 0.12** (from 0.11; breaking: rutis types are in this crate's API, so the next release is 0.6.0). `rutis`, `rutis-bridge` and `rutis-loader` 0.12, the npm runtimes (`@arcships/rutis`, `-runtime`, `-bun`) 0.12.0, PyPI `rutis` 0.12.0 and the Go module v0.12.0 move together; Rust 1.88 as before. One code change: `probe` keeps the old sharing rule (below). Two behaviour changes from rutis: services a plugin `ctx.provide`s without declaring them now reach rutis, so on a name clash the row providing it later fails (rename it, or list it in that row's `isolate`; the pi adapter's `host-ui.ts` provides `pi-host-ui`, so load it in one runtime only); and `ServiceCatalog::new()` shares every name by name, so a Cordis row injecting a service nobody provides now waits in rutis instead of reading as started (`share_registered_only()` restores the old rule — `probe` uses it, so a DSH plugin missing an app service is still reported at once). New tests pin the probe's quick report and that `host-ui.ts`'s undeclared `pi-host-ui` provide still brings pi dialogs to the host; the pi and DSH tests now refuse a stale (pre-0.12) runtime install. rutis 0.12 also lets a Rust service see the row that calls it (`session::caller_row`, arcships/rutis#441), which the next change uses.
+
 ## yoagent-rutis 0.5.1 (2026-10-18)
 
 yoagent-rutis only; requires yoagent 0.25, rutis 0.11 and Rust 1.88, as 0.5.0. **Upgrade from 0.5.0 if you trust pi tools per extension** (`offered_by.source`): its pi adapter could run a different extension's tool under an offered name. No Rust API change; the pi adapter gains the `nestedCalls` config.
