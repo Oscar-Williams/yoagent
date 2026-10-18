@@ -744,8 +744,24 @@ def apply(ctx, config):
     ctx.effect(ctx.use("yoagent").register("py-cancel", Handler(ctx.use("probe"))))
 "#;
 
+/// Registers `config.name` offering `config.tool`, and does **not** hand the
+/// disposer to `ctx.effect`: only the host can tie it to the row.
+const JS_ROW: &str = r#"
+import { definePlugin } from 'RUTIS'
+export default definePlugin({
+  inject: ['yoagent'],
+  apply(ctx, config) {
+    ctx.use('yoagent').register(config.name, {
+      async tools() { return [{ name: config.tool }] },
+      async call_tool() { return `${config.tool} ran` },
+    })
+  },
+})
+"#;
+
 struct Fixtures {
     js: PathBuf,
+    row: PathBuf,
     strict: PathBuf,
     cancel: PathBuf,
     images: PathBuf,
@@ -764,6 +780,8 @@ fn fixtures() -> Fixtures {
     std::fs::write(&js, JS_HOOKS.replace("RUTIS", &rutis)).unwrap();
     let strict = dir.path().join("strict.mjs");
     std::fs::write(&strict, JS_STRICT.replace("RUTIS", &rutis)).unwrap();
+    let row = dir.path().join("row.mjs");
+    std::fs::write(&row, JS_ROW.replace("RUTIS", &rutis)).unwrap();
     let cancel = dir.path().join("cancel.mjs");
     std::fs::write(&cancel, JS_CANCEL.replace("RUTIS", &rutis)).unwrap();
     let images = dir.path().join("images.mjs");
@@ -785,6 +803,7 @@ fn fixtures() -> Fixtures {
     .unwrap();
     Fixtures {
         js,
+        row,
         strict,
         cancel,
         images,
@@ -1053,6 +1072,123 @@ async fn unloading_a_row_unregisters_its_handler() {
     host.root.shutdown().await.unwrap();
 }
 
+/// rutis 0.12's caller row: a language handler's owner is the row that
+/// registered it (two rows of one Node runtime are two owners), and unloading
+/// one row removes its handler while the runtime and the other row run on,
+/// even though the plugin never handed its disposer to `ctx.effect`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_belongs_to_its_row_and_goes_with_it() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let alpha = ts_row(
+        "alpha",
+        &fixtures.row,
+        json!({ "name": "row-a", "tool": "a_tool" }),
+    );
+    let beta = ts_row(
+        "beta",
+        &fixtures.row,
+        json!({ "name": "row-b", "tool": "b_tool" }),
+    );
+    host.load(vec![alpha, beta.clone()]).await;
+    host.until_handlers(&["row-a", "row-b"]).await;
+    let owner = |name: &str| {
+        host.bridge
+            .registry()
+            .handlers()
+            .into_iter()
+            .find(|h| h.name() == name)
+            .map(|h| h.owner().to_string())
+    };
+    assert_eq!(owner("row-a").as_deref(), Some("alpha"));
+    assert_eq!(owner("row-b").as_deref(), Some("beta"));
+
+    // Only beta stays: alpha's row unloads, its runtime does not.
+    let patches: Vec<Patch> = serde_json::from_value(json!([{ "insert": [beta] }])).unwrap();
+    let report = host
+        .loader
+        .reconcile(vec![Layer::new("rows", patches)], None)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report:?}");
+    host.until_no_handler("row-a").await;
+    assert_eq!(owner("row-b").as_deref(), Some("beta"));
+
+    // A policy sees the row as the tool's owner, end to end.
+    let owners = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = owners.clone();
+    let watch = host
+        .root
+        .plugin(plugin(handler("watch").with_before_tool(move |call| {
+            record.lock().unwrap().push(call.offered_by.clone());
+            ToolDecision::Allow
+        })));
+    wait_active(&watch).await;
+    let (agent, seen) = agent(vec![call("b_tool", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(seen.lock().unwrap()[0].tools, vec!["b_tool".to_string()]);
+    let owners = owners.lock().unwrap().clone();
+    assert_eq!(owners.len(), 1, "{owners:?}");
+    let offered = owners[0].as_ref().expect("offered by a plugin");
+    assert_eq!((offered.handler(), offered.owner()), ("row-b", "beta"));
+    assert_eq!(
+        results,
+        vec![("b_tool".into(), "b_tool ran".into(), false)],
+        "the other row's handler still answers"
+    );
+    host.root.shutdown().await.unwrap();
+}
+
+/// A row restarted by a config change: its old handler is gone before the
+/// new generation registers the same name, which keeps the row as owner and
+/// serves the new config.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_row_registers_its_handler_again() {
+    let Some(node) = node_runtime() else {
+        return;
+    };
+    let fixtures = fixtures();
+    let host = host(Some(&node), None).await;
+    let row = |tool: &str| {
+        ts_row(
+            "alpha",
+            &fixtures.row,
+            json!({ "name": "row-a", "tool": tool }),
+        )
+    };
+    host.load(vec![row("a_tool")]).await;
+    host.until_handlers(&["row-a"]).await;
+    let patches: Vec<Patch> =
+        serde_json::from_value(json!([{ "insert": [row("a2_tool")] }])).unwrap();
+    let report = host
+        .loader
+        .reconcile(vec![Layer::new("rows", patches)], None)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{report:?}");
+    // The new generation serves the new config, under the same owner.
+    let mut tools = Vec::new();
+    for _ in 0..150 {
+        let (agent, seen) = agent(vec![text("done")]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        run(&mut agent, "go").await;
+        tools = seen.lock().unwrap()[0].tools.clone();
+        if tools == vec!["a2_tool".to_string()] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(tools, vec!["a2_tool".to_string()]);
+    let handlers = host.bridge.registry().handlers();
+    assert_eq!(handlers.len(), 1, "the old generation's entry is gone");
+    assert_eq!(handlers[0].owner(), "alpha");
+    host.root.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crashed_runtime_withdraws_its_handlers() {
     let Some(python) = python() else {
@@ -1062,6 +1198,15 @@ async fn a_crashed_runtime_withdraws_its_handlers() {
     let host = host(None, Some((&fx.py, &python))).await;
     host.load(vec![py_row("py", "py_hooks", json!({}))]).await;
     host.until_handlers(&["py-hooks"]).await;
+    // A Python row's handler belongs to its row too (rutis 0.12's caller row).
+    let owner = host
+        .bridge
+        .registry()
+        .handlers()
+        .into_iter()
+        .find(|h| h.name() == "py-hooks")
+        .map(|h| h.owner().to_string());
+    assert_eq!(owner.as_deref(), Some("py"));
 
     let denied = Reply::new("py_denied", "ran");
     let denied_runs = denied.runs();

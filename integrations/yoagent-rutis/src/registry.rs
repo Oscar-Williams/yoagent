@@ -313,8 +313,11 @@ impl Timings {
 ///
 /// `handler` and `owner` come from the bridge: the handler's registered name
 /// and the plugin it registered under — for a Rust plugin, the rutis plugin's
-/// name; for a language plugin, its runtime session (rutis does not tell the
-/// host which row of a runtime made a call). `source` is what the handler
+/// name; for a language plugin, the loader id of the row that registered it
+/// (rutis 0.12's `session::caller_row`, seen by the host, not said by the
+/// plugin), or its runtime session for a call from outside any row. Copies
+/// of one row in several instances of an instanced group share its id, and
+/// row ids and Rust plugin names (`Plugin::name()`) are one name space. `source` is what the handler
 /// says about the tool: the pi adapter gives the extension file that
 /// registered it; a language plugin may give any string. It is
 /// self-declared — a plugin could name another's — so a policy keyed on it

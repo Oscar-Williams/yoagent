@@ -1,5 +1,5 @@
 //! Plugins in other languages — TypeScript / JavaScript on Node or Bun,
-//! Python and Go — through [rutis-bridge](https://docs.rs/rutis-bridge) 0.9
+//! Python and Go — through [rutis-bridge](https://docs.rs/rutis-bridge) 0.12
 //! (the `node`, `bun`, `python`, `go` and `websocket` features).
 //!
 //! With one of those features, [`RutisBridge::install`](crate::RutisBridge::install)
@@ -26,8 +26,11 @@
 //!
 //! `register(name, handler, options?)` returns a function that unregisters
 //! the handler: pass it to `ctx.effect`, so the handler goes when the plugin
-//! unloads. When the plugin's runtime process exits or crashes, its session
-//! closes and every handler it registered is removed too. A handler whose
+//! unloads. A plugin loaded as a row (with `yoagent` in its `inject`) is tied
+//! to that row by the host as well (rutis 0.12's caller row): its handlers go
+//! when the row unloads or restarts, and their owner is the row's loader id.
+//! When the plugin's runtime process exits or crashes, its session closes
+//! and every handler it registered is removed too. A handler whose
 //! runtime is gone while a run still holds it is unavailable, like a Rust
 //! plugin's after an unload: its tool calls fail, its `before_tool` denies,
 //! its `on_input` rejects, its `after_tool` withholds.
@@ -63,7 +66,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
-use rutis::Ctx;
+use rutis::{Ctx, Effect};
 use rutis_bridge::session::{self, host_key, Error, HostDispatch, Reference, Reply, Value};
 use serde_json::{json, Value as Json};
 use tokio_util::sync::CancellationToken;
@@ -270,21 +273,85 @@ impl Service {
             }
         }
         let caller = session::caller();
-        let owner = match &caller {
-            Some(connection) => format!("language plugin (session {})", connection.tag()),
-            None => "language plugin".to_string(),
+        // The row making the call (rutis 0.12), when it comes from one: its
+        // loader id is the owner, attested by the host rather than said by
+        // the plugin, and the registration lives no longer than the row.
+        let row = session::caller_row();
+        let owner = match (&row, &caller) {
+            (Some(row), _) => row.id().to_string(),
+            (None, Some(connection)) => {
+                format!("language plugin (session {})", connection.tag())
+            }
+            (None, None) => "language plugin".to_string(),
         };
+        if row.is_none() && caller.is_some() {
+            // A plugin that found `yoagent` without declaring it in `inject`,
+            // or a runtime without per-row scopes: a policy keyed on row ids
+            // does not see this handler as any row's.
+            tracing::info!(
+                handler = %name,
+                owner = %owner,
+                "registered by no row (`yoagent` not in its `inject`, or a runtime without row scopes): \
+                 owned by its session, removed when the session closes or by its disposer"
+            );
+        }
         let handler = Arc::new(RemoteHandler {
             name: name.clone(),
             target: Arc::new(target),
             hooks,
             events: Arc::new(options.events),
         });
-        let lifetime = CancellationToken::new();
+        // Unavailable as soon as the row starts unloading (its generation's
+        // token, as for a Rust plugin), or when the disposer runs.
+        let lifetime = match &row {
+            Some(row) => row.ctx().cancellation_token().child_token(),
+            None => CancellationToken::new(),
+        };
         let (seq, _gate) = self
             .registry
             .insert(name.clone(), owner, handler, lifetime.clone())
             .map_err(session::native_error)?;
+        // Removed when the row unloads or restarts, while its runtime runs
+        // on, whether or not the plugin hands the disposer to `ctx.effect`:
+        // the session watch below removes it as the row's token is cancelled
+        // (a spawned task), and this effect removes it synchronously in the
+        // row's cleanup, so it is gone before a restarted row registers the
+        // name again.
+        let mut row_effect = None;
+        if let Some(row) = &row {
+            let registry = Arc::downgrade(&self.registry);
+            let ended = lifetime.clone();
+            let tied = row
+                .ctx()
+                .effect_named(format!("yoagent handler: {name}"), move || {
+                    Effect::Disposer(Box::new(move || {
+                        ended.cancel();
+                        if let Some(registry) = registry.upgrade() {
+                            registry.remove(seq);
+                        }
+                        Ok(())
+                    }))
+                });
+            match tied {
+                Ok(disposer) => row_effect = Some(disposer),
+                Err(error) => {
+                    // The row is no longer loading or active: nothing would
+                    // remove the entry.
+                    lifetime.cancel();
+                    self.registry.remove(seq);
+                    tracing::info!(
+                        handler = %name,
+                        row = %row.id(),
+                        %error,
+                        "registration refused: its row is no longer loading or active"
+                    );
+                    return Err(session::native_error(format!(
+                        "register `{name}`: row `{}` is no longer loading or active ({error})",
+                        row.id()
+                    )));
+                }
+            }
+        }
         // The runtime crashed or exited: its session closed, and the handler
         // goes with it.
         match caller {
@@ -310,11 +377,21 @@ impl Service {
             ),
         }
         let registry = Arc::downgrade(&self.registry);
+        let runtime = self.runtime.clone();
+        // An explicit unregister also drops the row's effect record, so a
+        // plugin re-registering on every config change does not pile them up.
+        let row_effect = std::sync::Mutex::new(row_effect);
         let _entered = self.runtime.enter();
         Ok(Value::callback(move |_| {
             lifetime.cancel();
             if let Some(registry) = registry.upgrade() {
                 registry.remove(seq);
+            }
+            let effect = row_effect.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(effect) = effect {
+                runtime.spawn(async move {
+                    let _ = effect.dispose().await;
+                });
             }
             Ok(Value::Undefined)
         }))
