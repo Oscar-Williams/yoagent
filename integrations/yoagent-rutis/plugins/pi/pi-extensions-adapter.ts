@@ -124,7 +124,15 @@
 // `pi.sendMessage` are recorded in the adapter's in-memory session (readable
 // through `ctx.sessionManager`; a displayed message is also logged; a message
 // never starts a turn); other runtime actions (`pi.sendUserMessage`,
-// `pi.setModel`, ...) throw "not available in yoagent". `ctx.hasUI` is false and `ctx.ui` behaves as in
+// `pi.setModel`, ...) throw "not available in yoagent". `pi.exec` runs only
+// what the host's `exec` setting allows (default nothing; a refusal is a
+// failed command, code 126, empty stdout): each factory gets a `pi` whose
+// `exec` is gated, so extensions are imported through pi's loader by a
+// generated wrapper and run with its `loadExtensionFromFactory` (`loadGated`;
+// every load, whatever `exec` is). Fixed answers — `ctx.isProjectTrusted()`
+// (the host's `projectTrusted`, default false), `ctx.model`,
+// `ctx.modelRegistry`, `ctx.getContextUsage()`, print-mode dialogs — are
+// logged once per question and answer as `[pi] fixed answer: …`. `ctx.hasUI` is false and `ctx.ui` behaves as in
 // pi's print mode: `confirm` answers false, `select` and `input` nothing, so
 // a policy that would ask the user denies instead. When the host provides a
 // `ui` service (yoagent-frontend, experimental) and loads `host-ui.ts` next
@@ -159,6 +167,18 @@ export interface Config {
    * registration is the calling tool's own extension's), `"off"`. A refused call is an error result to the caller.
    */
   nestedCalls?: 'any' | 'own-extension' | 'off'
+  /**
+   * What `pi.exec(command, args)` may run: `false` or `[]` (default: nothing), `true` (anything,
+   * as pi), or the commands allowed, each matched against `command` exactly: `"git"` allows `git`
+   * (found on `PATH`), not `/usr/bin/git` or `./git`. Only the command is checked; its arguments
+   * and `options.cwd` are the extension's, so allowing a command that can run others (`git`, `sh`,
+   * `node`, `npx`) allows those too. A refused call resolves as a failed command (code 126, empty
+   * `stdout`, the reason in `stderr`) and is reported at warn, once per extension and command.
+   * This gates pi's API only: an extension is code the host runs and may start processes itself.
+   */
+  exec?: boolean | string[]
+  /** What `ctx.isProjectTrusted()` answers (default `false`; pi's own default is `true`). */
+  projectTrusted?: boolean
 }
 
 /**
@@ -275,14 +295,30 @@ let report = (level: 'error' | 'warn' | 'info' | 'debug', message: string) => {
   console.warn(message)
 }
 
+/**
+ * A question pi's API asks that this adapter answers with a fixed value: said
+ * once per question and answer (per runtime, shared by every adapter in it), at info, under one tag hosts can search for, so a plugin
+ * that does nothing can be traced to the answer it got.
+ */
+const answered = new Set<string>()
+function fixedAnswer<T>(question: string, answer: T, shown: string = JSON.stringify(answer) ?? 'undefined'): T {
+  // Keyed by the answer too: two adapters in one runtime may answer differently.
+  const key = `${question}\0${shown}`
+  if (!answered.has(key)) {
+    answered.add(key)
+    report('info', `[pi] fixed answer: ${question} → ${shown}`)
+  }
+  return answer
+}
+
 /** pi's print-mode UI (its `noOpUIContext`): nothing to show, no one to ask. */
 const NO_UI = new Proxy(
   {
-    select: async () => undefined,
-    confirm: async () => false,
-    input: async () => undefined,
-    editor: async () => undefined,
-    custom: async () => undefined,
+    select: async () => fixedAnswer('ctx.ui.select() (no user to ask)', undefined),
+    confirm: async () => fixedAnswer('ctx.ui.confirm() (no user to ask)', false),
+    input: async () => fixedAnswer('ctx.ui.input() (no user to ask)', undefined),
+    editor: async () => fixedAnswer('ctx.ui.editor() (no user to ask)', undefined),
+    custom: async () => fixedAnswer('ctx.ui.custom() (no user to ask)', undefined),
     notify: (message: string, level?: string) =>
       report(level === 'error' ? 'error' : level === 'warning' ? 'warn' : 'info', `[pi ${level ?? 'info'}] ${message}`),
     onTerminalInput: () => () => {},
@@ -407,20 +443,179 @@ interface PiRuntime {
   [action: string]: unknown
 }
 
+interface PiApi {
+  exec(command: string, args: string[], options?: unknown): Promise<ExecResult>
+  [member: string]: unknown
+}
+type ExecResult = { stdout: string; stderr: string; code: number; killed: boolean }
+type Factory = (pi: PiApi) => unknown
+type Loaded = {
+  extensions: PiExtension[]
+  errors: { path: string; error: string }[]
+  warnings?: { path: string; warning: string }[]
+  runtime: PiRuntime
+}
+
 /**
  * pi's loader, by file: the package exports only `discoverAndLoadExtensions`,
  * which also loads `<cwd>/.pi/extensions` and `~/.pi/agent/extensions`.
  */
-async function piLoader(): Promise<{
-  loadExtensions(paths: string[], cwd: string): Promise<{
-    extensions: PiExtension[]
-    errors: { path: string; error: string }[]
-    warnings?: { path: string; warning: string }[]
-    runtime: PiRuntime
-  }>
-}> {
+async function piModule<T>(path: string): Promise<T> {
   const index = import.meta.resolve('@earendil-works/pi-coding-agent')
-  return import(new URL('./core/extensions/loader.js', index).href)
+  return import(new URL(path, index).href)
+}
+
+/** The event a wrapper below hands its extension's factory over on (the load's own pi event bus). */
+const FACTORY_EVENT = 'yoagent-rutis.pi.factory'
+
+/**
+ * Load extensions as pi's `loadExtensions` does, except that each factory is
+ * given `gate(pi)` instead of pi's API object: `pi.exec` lives on that object,
+ * created inside pi's loader with no hook, so gating it means calling the
+ * factory ourselves. pi's loader still imports every module (its resolution
+ * and aliases): it loads one generated wrapper per extension, which only hands
+ * the extension's factory over; pi's exported `loadExtensionFromFactory` then
+ * runs it, under the extension's own resolved path.
+ */
+async function loadGated(paths: string[], cwd: string, gate: (pi: PiApi, path: string) => PiApi): Promise<Loaded> {
+  const loader = await piModule<{
+    loadExtensions(paths: string[], cwd: string, eventBus: unknown, runtime: unknown): Promise<Loaded>
+    loadExtensionFromFactory(factory: Factory, cwd: string, eventBus: unknown, runtime: unknown, path: string): Promise<PiExtension>
+    createExtensionRuntime(): PiRuntime
+  }>('./core/extensions/loader.js')
+  const { createEventBus } = await piModule<{
+    createEventBus(): { on(channel: string, handler: (data: unknown) => void): () => void }
+  }>('./core/event-bus.js')
+  const { resolvePath } = await piModule<{ resolvePath(input: string, base: string, options?: unknown): string }>(
+    './utils/paths.js',
+  )
+  const eventBus = createEventBus()
+  const runtime = loader.createExtensionRuntime()
+  const extensions: PiExtension[] = []
+  const errors: { path: string; error: string }[] = []
+  // First every module, through pi's loader (file I/O); then every factory,
+  // back to back, as pi runs them: nothing but the factories happens between
+  // the last of them and the adapter's load-time checks.
+  const imported: { path: string; resolved: string; factory: Factory }[] = []
+  const dir = await wrapperDir()
+  const wrappers: { wrapper: string; path: string; resolved: string }[] = []
+  for (const path of paths) {
+    const resolved = resolvePath(path, cwd, { normalizeUnicodeSpaces: true })
+    wrappers.push({ wrapper: await writeWrapper(dir, resolved), path, resolved })
+  }
+  // Each wrapper hands its factory over on this load's own event bus, which
+  // calls the handler synchronously: no state shared with other loads, so two
+  // adapters loading one file at once each get their own module's factory.
+  // pi's loader runs the wrappers in order, one each (a file listed twice runs
+  // twice, as in pi).
+  const handed: { path: string; factory: unknown }[] = []
+  const unsubscribe = eventBus.on(FACTORY_EVENT, (data) => {
+    handed.push(data as { path: string; factory: unknown })
+  })
+  let first: Loaded
+  try {
+    first = await loader.loadExtensions(
+      wrappers.map((w) => w.wrapper),
+      cwd,
+      eventBus,
+      runtime,
+    )
+  } finally {
+    unsubscribe()
+  }
+  // pi reports failures in the order of the paths it was given.
+  const failures = [...first.errors]
+  for (const { wrapper, path, resolved } of wrappers) {
+    if (failures[0]?.path === wrapper) {
+      errors.push({ path, error: failures.shift()!.error.replaceAll(wrapper, resolved) })
+      continue
+    }
+    const next = handed.findIndex((h) => h.path === resolved)
+    const factory = next === -1 ? undefined : handed.splice(next, 1)[0].factory
+    if (typeof factory !== 'function') {
+      errors.push({ path, error: `Extension does not export a valid factory function: ${path}` })
+    } else imported.push({ path, resolved, factory: factory as Factory })
+  }
+  for (const { path, resolved, factory } of imported) {
+    try {
+      extensions.push(
+        await loader.loadExtensionFromFactory((pi) => factory(gate(pi, resolved)), cwd, eventBus, runtime, resolved),
+      )
+    } catch (error) {
+      errors.push({ path, error: `Failed to load extension: ${message(error)}` })
+    }
+  }
+  const warnings = (first.warnings ?? []).map((w) => {
+    const at = wrappers.find((x) => x.wrapper === w.path)
+    return at ? { path: at.path, warning: w.warning.replaceAll(at.wrapper, at.resolved) } : w
+  })
+  return { extensions, errors, warnings, runtime }
+}
+
+/**
+ * The directory the wrappers live in: one per user under the temp directory,
+ * kept, so each extension's wrapper has a stable name and content and pi's
+ * jiti reuses its transpile cache (a fresh name per load would leave a cache
+ * file behind every time). Refused unless it is a real directory of this
+ * user's that nobody else can write: a wrapper is code this runtime runs.
+ */
+async function wrapperDir(): Promise<string> {
+  const { mkdir, lstat } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const uid = process.getuid?.()
+  const dir = join(tmpdir(), `yoagent-pi-wrappers-${uid ?? 'user'}`)
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    const info = await lstat(dir)
+    // Windows reports no POSIX owner or mode bits (a writable directory reads 0o777), and its
+    // temp directory is per-user already: there, only that it is a real directory is checked.
+    const posix = process.platform !== 'win32'
+    if (!info.isDirectory() || (posix && ((uid !== undefined && info.uid !== uid) || (info.mode & 0o022) !== 0))) {
+      throw new Error('it is not a directory of this user\'s that only this user can write')
+    }
+  } catch (error) {
+    throw new Error(`pi adapter: cannot use ${dir} for the extension wrappers (every extension is loaded through one there): ${message(error)}`)
+  }
+  return dir
+}
+
+/** Writes (atomically) and returns the wrapper that hands `resolved`'s factory over. */
+async function writeWrapper(dir: string, resolved: string): Promise<string> {
+  const { writeFile, rename } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { createHash } = await import('node:crypto')
+  const wrapper = join(dir, `${createHash('sha256').update(resolved).digest('hex').slice(0, 32)}.ts`)
+  const source =
+    `import factory from ${JSON.stringify(resolved)}\n` +
+    `export default (pi) => { pi.events.emit(${JSON.stringify(FACTORY_EVENT)}, { path: ${JSON.stringify(resolved)}, factory }) }\n`
+  const temporary = `${wrapper}.${randomUUID()}`
+  await writeFile(temporary, source, { mode: 0o600 })
+  await rename(temporary, wrapper)
+  return wrapper
+}
+
+/** `pi.exec` as the host's `exec` grant allows it; everything else on pi's API as it is. */
+function gateExec(exec: boolean | string[]) {
+  const refusedOnce = new Set<string>()
+  return (pi: PiApi, path: string): PiApi => {
+    if (exec === true) return pi
+    const allowed = (command: string) => Array.isArray(exec) && exec.includes(command)
+    const gated = (command: string, args: string[], options?: unknown): Promise<ExecResult> => {
+      if (allowed(command)) return pi.exec(command, args, options)
+      const why = `pi.exec("${command}") is not allowed by the host (the adapter's \`exec\` setting)`
+      const key = `${path}\0${command}`
+      if (!refusedOnce.has(key)) {
+        refusedOnce.add(key)
+        report('warn', `[pi] ${path}: refused ${why}`)
+      }
+      return Promise.resolve({ stdout: '', stderr: why, code: 126, killed: false })
+    }
+    // A copy, not a Proxy: a Proxy's target still hands the real `exec` out
+    // through `Object.getOwnPropertyDescriptor`. pi's API methods are
+    // closures that never use `this`, and `events` is shared by reference.
+    return { ...pi, exec: gated }
+  }
 }
 
 const short = (path: string) => path.split('/').pop() ?? path
@@ -507,6 +702,8 @@ export default definePlugin<Config>({
       allowUnmapped: { type: 'array', items: { type: 'string' } },
       strict: { type: 'boolean' },
       nestedCalls: { type: 'string', enum: ['any', 'own-extension', 'off'] },
+      exec: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+      projectTrusted: { type: 'boolean' },
     },
   },
   async apply(ctx, config) {
@@ -531,7 +728,15 @@ export default definePlugin<Config>({
 
     const { SessionManager } = await import('@earendil-works/pi-coding-agent')
     const { validateToolArguments } = await import('@earendil-works/pi-ai')
-    const loaded = await (await piLoader()).loadExtensions(config.extensions, cwd)
+    const exec = config.exec ?? false
+    if (typeof exec !== 'boolean' && !(Array.isArray(exec) && exec.every((c) => typeof c === 'string'))) {
+      throw new Error(`exec must be true, false or a list of commands, not ${JSON.stringify(exec)}`)
+    }
+    report(
+      'debug',
+      `[pi] pi.exec allowed: ${exec === true ? 'anything' : exec === false || exec.length === 0 ? 'nothing' : exec.join(', ')}`,
+    )
+    const loaded = await loadGated(config.extensions, cwd, gateExec(exec))
     if (loaded.errors.length > 0) {
       throw new Error(`pi extensions failed to load: ${loaded.errors.map((e) => `${e.path}: ${e.error}`).join('; ')}`)
     }
@@ -577,15 +782,20 @@ export default definePlugin<Config>({
       hasUI: hostUiService !== undefined,
       cwd,
       sessionManager,
-      modelRegistry: undefined,
-      model: undefined,
+      get modelRegistry() {
+        return fixedAnswer('ctx.modelRegistry', undefined)
+      },
+      get model() {
+        return fixedAnswer('ctx.model', undefined)
+      },
       scopedModels: [],
       signal,
       isIdle: () => signal === undefined,
-      // pi's own default is true; this adapter loads only the files it is given, never a project's `.pi`.
-      isProjectTrusted: () => false,
+      // pi's own default is true; this adapter loads only the files it is given, never a project's
+      // `.pi`, and a host opts in (`projectTrusted`) to what extensions do in a trusted project.
+      isProjectTrusted: () => fixedAnswer('ctx.isProjectTrusted()', config.projectTrusted ?? false),
       hasPendingMessages: () => false,
-      getContextUsage: () => undefined,
+      getContextUsage: () => fixedAnswer('ctx.getContextUsage()', undefined),
       getSystemPrompt: () => systemPrompt,
       abort: () => {
         throw new Error('ctx.abort() is not available in yoagent')
@@ -722,8 +932,9 @@ export default definePlugin<Config>({
     /** A tool's `ctx`: the extension context, plus `tools` and `executeTool` for nested calls. */
     const toolContext = (signal: AbortSignal, runId: string, callId: string, depth: number, caller: string | undefined) => {
       let nested = 0
-      return {
-        ...context(signal),
+      // Added onto the context, not spread: a spread reads every getter, which would log
+      // fixed answers (`ctx.model`, ...) no extension asked for.
+      return Object.defineProperties(context(signal), Object.getOwnPropertyDescriptors({
         get tools() {
           // The run's frozen copies (a tool cannot swap another's `execute` through them), only
           // those `nestedCalls` lets this tool call.
@@ -731,7 +942,7 @@ export default definePlugin<Config>({
         },
         executeTool: (name: string, args: unknown, options?: { signal?: AbortSignal }) =>
           executeNested(runId, callId, `${callId}/${++nested}`, name, args, options?.signal ?? signal, depth, caller),
-      }
+      }))
     }
 
     /** Every handler of `event`, in extension load and registration order. */

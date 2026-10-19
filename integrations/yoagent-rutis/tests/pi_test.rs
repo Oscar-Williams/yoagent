@@ -1752,3 +1752,235 @@ export default function (pi) {{
     assert!(!ran.exists(), "no tool ran");
     host.root.shutdown().await.unwrap();
 }
+
+/// `pi.exec` runs only what the host's `exec` setting allows: nothing by
+/// default, exactly the listed commands (a name is not its path, nor a path
+/// its name), or anything with `true` — also when an extension takes `exec`
+/// from `Object.getOwnPropertyDescriptor(pi, 'exec')`.
+/// A refusal is a failed command (code 126, the reason in stderr), never a
+/// throw. `ctx.isProjectTrusted()` answers the host's `projectTrusted`.
+#[tokio::test(flavor = "multi_thread")]
+async fn pi_exec_runs_only_what_the_host_allows() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ext = extension(
+        dir.path(),
+        "exec.ts",
+        r#"
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_exec',
+    label: 'pi_exec',
+    description: 'runs a command through pi.exec',
+    parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+    async execute(_id, params, _signal, _update, ctx) {
+      const r = await pi.exec(params.command, ['hi'])
+      return {
+        content: [{ type: 'text', text: `code=${r.code} out=${r.stdout.trim()} err=${r.stderr} trusted=${ctx.isProjectTrusted()}` }],
+        details: {},
+      }
+    },
+  })
+  // The real `exec` must not be reachable around the gate either.
+  const viaDescriptor = Object.getOwnPropertyDescriptor(pi, 'exec').value
+  pi.registerTool({
+    name: 'pi_exec_descriptor',
+    label: 'pi_exec_descriptor',
+    description: 'runs echo through the property descriptor',
+    parameters: { type: 'object', properties: {} },
+    async execute() {
+      const r = await viaDescriptor('echo', ['hi'])
+      return { content: [{ type: 'text', text: `code=${r.code}` }], details: {} }
+    },
+  })
+}
+"#,
+    );
+    let echo = which_echo();
+    for (config, expect) in [
+        (json!({}), ["code=126", "code=126"]),
+        (json!({ "exec": ["echo"] }), ["code=0 out=hi", "code=126"]),
+        (
+            json!({ "exec": [echo.clone()] }),
+            ["code=126", "code=0 out=hi"],
+        ),
+        (
+            json!({ "exec": true, "projectTrusted": true }),
+            ["code=0 out=hi", "code=0 out=hi"],
+        ),
+    ] {
+        let host = host(&runtime).await;
+        let mut row = json!({ "extensions": [ext] });
+        row.as_object_mut()
+            .unwrap()
+            .extend(config.as_object().unwrap().clone());
+        host.load(adapter_row(row)).await;
+        let (agent, _) = agent(vec![
+            calls(&[
+                ("pi_exec", json!({ "command": "echo" })),
+                ("pi_exec", json!({ "command": echo })),
+                ("pi_exec_descriptor", json!({})),
+            ]),
+            text("done"),
+        ]);
+        let mut agent = agent.with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        assert_eq!(results.len(), 3, "{results:?}");
+        // The descriptor path is gated like `pi.exec` (refused unless `echo` is allowed).
+        let by_name = expect[0];
+        assert!(
+            results[2]
+                .1
+                .contains(&by_name[..by_name.find(' ').unwrap_or(by_name.len())]),
+            "{results:?}"
+        );
+        for (result, want) in results.iter().zip(expect) {
+            assert!(
+                !result.2 && result.1.contains(want),
+                "{config}: {results:?}"
+            );
+            if want == "code=126" {
+                assert!(result.1.contains("not allowed by the host"), "{results:?}");
+            }
+        }
+        let trusted = config["projectTrusted"] == true;
+        assert!(
+            results[0].1.ends_with(&format!("trusted={trusted}")),
+            "{results:?}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// The absolute path of `echo` (so a listed path is tested as a path).
+fn which_echo() -> String {
+    for dir in ["/bin", "/usr/bin"] {
+        let path = format!("{dir}/echo");
+        if Path::new(&path).exists() {
+            return path;
+        }
+    }
+    panic!("no echo in /bin or /usr/bin");
+}
+
+/// Extensions still load through the adapter's wrappers as pi loads them (a
+/// directory with `index.ts`, a CommonJS module), and a failed one is named by
+/// its own path, never the wrapper's. An `exec` setting that is not `true`,
+/// `false` or a list of commands refuses the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn extensions_load_through_the_wrappers_as_pi_loads_them() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let tool = |name: &str| {
+        format!(
+            "pi.registerTool({{ name: '{name}', label: '{name}', description: 'x', parameters: {{ type: 'object', properties: {{}} }}, \
+             async execute() {{ return {{ content: [{{ type: 'text', text: '{name} ran' }}], details: {{}} }} }} }})"
+        )
+    };
+    std::fs::create_dir(dir.path().join("dir_ext")).unwrap();
+    extension(
+        &dir.path().join("dir_ext"),
+        "index.ts",
+        &format!("export default function (pi) {{ {} }}", tool("from_dir")),
+    );
+    let cjs = extension(
+        dir.path(),
+        "cjs_ext.cjs",
+        &format!("module.exports = function (pi) {{ {} }}", tool("from_cjs")),
+    );
+    let loaded = host(&runtime).await;
+    loaded
+        .load(adapter_row(json!({
+            "extensions": [dir.path().join("dir_ext"), cjs],
+        })))
+        .await;
+    let (agent, _) = agent(vec![
+        calls(&[("from_dir", json!({})), ("from_cjs", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(loaded.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].1.contains("from_dir ran") && results[1].1.contains("from_cjs ran"),
+        "{results:?}"
+    );
+    loaded.root.shutdown().await.unwrap();
+
+    let broken = extension(
+        dir.path(),
+        "broken.ts",
+        "export default function (pi) { this is not code }",
+    );
+    let named = extension(dir.path(), "named.ts", "export const notDefault = 1");
+    let missing = dir.path().join("missing.ts");
+    for (path, want) in [
+        (&broken, "broken.ts"),
+        (&named, "does not export a valid factory function"),
+        (&missing, "missing.ts"),
+    ] {
+        let host = host(&runtime).await;
+        let failures = host
+            .try_load(adapter_row(json!({ "extensions": [path] })))
+            .await;
+        assert!(failures.contains(want), "{failures}");
+        assert!(
+            !failures.contains("yoagent-pi-wrappers"),
+            "names the wrapper: {failures}"
+        );
+        host.root.shutdown().await.unwrap();
+    }
+    for exec in [json!("echo"), json!([1])] {
+        let host = host(&runtime).await;
+        let failures = host
+            .try_load(adapter_row(json!({ "extensions": [cjs], "exec": exec })))
+            .await;
+        assert!(failures.contains("exec"), "{exec}: {failures}");
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// Two adapters in one runtime loading the same extension at once each get
+/// it: the wrapper hands its factory over on its own load's event bus, so the
+/// loads share nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_adapters_load_one_extension_at_once() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let host = host(&runtime).await;
+    let row = |id: &str| {
+        json!({
+            "id": id,
+            "name": pi_dir().join("pi-extensions-adapter.ts"),
+            "config": {
+                "name": id,
+                "extensions": [pi_dir().join("fixture-extension.ts")],
+                "toolNames": {},
+            },
+        })
+    };
+    let failures = host.try_load(json!([row("pi-a"), row("pi-b")])).await;
+    assert!(failures.is_empty(), "{failures}");
+    let registry = host.bridge.registry().clone();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let names: Vec<String> = registry
+                .handlers()
+                .iter()
+                .map(|h| h.name().to_owned())
+                .collect();
+            if names.iter().any(|n| n == "pi-a") && names.iter().any(|n| n == "pi-b") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both adapters register their handler");
+    host.root.shutdown().await.unwrap();
+}
