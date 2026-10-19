@@ -110,12 +110,28 @@
 //                           rewrite fails the run only for a required bridge,
 //                           and refuses every later run.
 //
+// Observers (OBSERVED_EVENTS: `agent_start` / `agent_end`, `turn_start` /
+// `turn_end`, `message_start` / `message_update`, `tool_execution_*`) fire
+// from yoagent's event stream when a handler for them exists at load (the
+// bridge's `on_event`, subscribed to the yoagent types they need): after the
+// fact and in order, on copies, on the adapter's own chain (`on_event` returns
+// at once, so a slow observer never meets the bridge's per-event timeout; a
+// handler gets OBSERVER_HANDLER_BUDGET_MS before the chain moves on; past
+// MAX_OBSERVER_BACKLOG waiting, streaming events are dropped, lifecycle ones
+// past twice that, counted and reported per burst; unloading waits up to
+// OBSERVER_DRAIN_MS for the queue before `session_shutdown`), a result ignored
+// (`turn_end`'s `continue` / `entries` reported once), a throw reported once per run; tool calls under pi's names and argument shapes, in the tool
+// events and inside messages; `turn_end` only for a turn that ended with an
+// assistant message (the index advances at every turn's end), with generated
+// entry ids and an empty context preview. `message_end` (the checked path) is
+// not ordered with these. One registered later fires if its types are subscribed.
+//
 // What does not map: no other event is ever fired. Events that would decide
 // or rewrite something yoagent does (DECIDING_EVENTS: `context_with_system`,
 // `before_provider_request`, ...; `context` and `message_end` too when
-// registered after load) refuse the load unless listed in `allowUnmapped`; the rest (observers such as `agent_end` or
-// `tool_execution_*`, pi's session events, the boundary events `turn_end` /
-// `agent_before_settle`), commands, shortcuts, flags, renderers, model
+// registered after load) refuse the load unless listed in `allowUnmapped`; the rest (an
+// observer registered after load whose types are not subscribed, pi's session
+// events, `agent_before_settle`, `agent_settled`), commands, shortcuts, flags, renderers, model
 // providers, virtual models and MCP servers are reported (at info: expected,
 // not a fault; a load failure with `strict`). One registered after load (in a handler or a
 // tool) is reported at the next model request or tool call, and a deciding
@@ -267,6 +283,47 @@ const DECIDING_EVENTS = new Set([
 
 /** Events whose handlers run on copies, stopping the adapter if one would change what it got. */
 const CHECKED_EVENTS = new Set(['context', 'message_end'])
+
+/**
+ * pi's observer events, fired from yoagent's event stream (`on_event`):
+ * after the fact, so a handler's result changes nothing. Each needs the
+ * yoagent event types listed. `message_end` is not here: its handlers run
+ * on the checked path (CHECKED_EVENTS), once per message.
+ */
+const OBSERVED_EVENTS = new Map<string, string[]>([
+  ['agent_start', ['agentStart']],
+  ['agent_end', ['agentEnd']],
+  // Both need both: the turn index advances at every turn's end, as in pi.
+  ['turn_start', ['turnStart', 'turnEnd']],
+  ['turn_end', ['turnStart', 'turnEnd']],
+  ['message_start', ['messageStart']],
+  ['message_update', ['messageUpdate']],
+  ['tool_execution_start', ['toolExecutionStart']],
+  ['tool_execution_update', ['toolExecutionStart', 'toolExecutionUpdate']],
+  ['tool_execution_end', ['toolExecutionEnd']],
+])
+
+/**
+ * Most observer events waiting for slow handlers: past it, streaming events
+ * (`message_update`, `tool_execution_update`) are dropped; lifecycle events
+ * (starts and ends) only past twice as many, so a tracer's spans close.
+ */
+const MAX_OBSERVER_BACKLOG = 1000
+
+/** Events whose loss leaves only a gap in a stream, not an open span. */
+const STREAMING_EVENTS = new Set(['message_update', 'tool_execution_update'])
+
+/**
+ * How long one observer handler may take before the queue moves on without
+ * it (it is reported once per run; the handler itself is not stopped).
+ */
+const OBSERVER_HANDLER_BUDGET_MS = 30_000
+
+/** How long unloading waits for queued observer events before `session_shutdown`. */
+const OBSERVER_DRAIN_MS = 5_000
+
+/** pi's names for yoagent's stream deltas (`message_update`'s `assistantMessageEvent.type`). */
+const DELTA_TYPES: Record<string, string> = { text: 'text_delta', thinking: 'thinking_delta', toolCallDelta: 'toolcall_delta' }
 
 /** pi's message shape from yoagent's (they match; pi's assistant messages also name their API). */
 const piMessage = (message: Message) =>
@@ -686,7 +743,14 @@ function canon(value: unknown): string {
   })
 }
 
-const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
+const message = (error: unknown) => {
+  try {
+    return error instanceof Error ? error.message : String(error)
+  } catch {
+    // An error whose own `toString` throws (or that has none).
+    return Object.prototype.toString.call(error)
+  }
+}
 
 export default definePlugin<Config>({
   inject: ['yoagent'],
@@ -1079,6 +1143,7 @@ export default definePlugin<Config>({
         for (const event of ext.handlers.keys()) {
           if (MAPPED_EVENTS.has(event)) continue
           if (watching && CHECKED_EVENTS.has(event)) continue
+          if (observed(event)) continue
           if (DECIDING_EVENTS.has(event) && !allowUnmapped.has(event)) deciding.push(own(`event "${event}"`))
           else ignored.push(own(`event "${event}"`))
         }
@@ -1285,8 +1350,12 @@ export default definePlugin<Config>({
         started.push(`${short(ext.path)}: ${message(error)}`)
       }
     }
+    // Set once the observers exist: stops them and waits (bounded) for what is queued, so a
+    // tracer's `agent_end` comes before its `session_shutdown`, as in pi.
+    let drainObservers: () => Promise<void> = async () => {}
     // Registered first, so a refusal below still shuts the extensions down.
     ctx.effect(async () => {
+      await drainObservers()
       for (const { ext, fn } of handlers('session_shutdown')) {
         try {
           await fn({ type: 'session_shutdown', reason: 'quit' }, context())
@@ -1300,9 +1369,260 @@ export default definePlugin<Config>({
       throw new Error(`pi extensions failed in session_start: ${started.join('; ')}`)
     }
     // After session_start, so what it registered is checked too.
+    // Observer events: the yoagent event types the handlers present at load need. One registered
+    // later is fired when its types are already subscribed, else reported as not available.
+    // (After session_start, like `watching`: what it registered counts.)
+    const subscribed = new Set<string>()
+    for (const [event, types] of OBSERVED_EVENTS) {
+      if (handlers(event).length > 0) for (const t of types) subscribed.add(t)
+    }
+    const observed = (event: string) =>
+      OBSERVED_EVENTS.has(event) && OBSERVED_EVENTS.get(event)!.every((t) => subscribed.has(t))
     watching = handlers('context').length + handlers('message_end').length > 0
     checkUnmapped(true)
     checkShadowing(true)
+
+    /** Per run: the turn index, and each running tool call's pi name and arguments. */
+    const turns = new Map<string, number>()
+    /** A run's tools kept past `finish` for its `agentEnd` (delivered after it), when subscribed. */
+    const ending = new Map<string, { offered: Map<string, PiTool> }>()
+    const running = new Map<string, { toolName: string; args: unknown }>()
+    const observerFailed = new Set<string>()
+    /** A yoagent tool call as pi names it: a pi tool keeps its name, a built-in gets pi's name and argument shape. */
+    const piCall = (runId: string, tool: string, args: unknown) => {
+      const own = (snapshots.get(runId) ?? ending.get(runId))?.offered.has(tool) ?? false
+      const shape = own ? undefined : ARGS.get(tool)
+      let input = args
+      try {
+        input = shape && args && typeof args === 'object' ? shape.toPi(args as Args) : args
+      } catch (error) {
+        // An argument shape that cannot take pi's form: shown in yoagent's.
+        report('debug', `[pi] ${tool}: arguments shown in yoagent's form to observers: ${message(error)}`)
+      }
+      return { toolName: own ? tool : (names.get(tool) ?? tool), args: input }
+    }
+    /** A message as pi's observers see it: its tool calls and results under pi's names and shapes. */
+    const observedMessage = (runId: string, message: Message) => {
+      const out = piMessage(message) as Record<string, unknown> & { role: string; content?: unknown }
+      if (out.role === 'assistant' && Array.isArray(out.content)) {
+        out.content = out.content.map((block: Record<string, unknown>) => {
+          if (block?.type !== 'toolCall' || typeof block.name !== 'string') return block
+          const call = piCall(runId, block.name, block.arguments)
+          return { ...block, name: call.toolName, arguments: call.args }
+        })
+      }
+      if (out.role === 'toolResult' && typeof out.toolName === 'string') {
+        out.toolName = piCall(runId, out.toolName, undefined).toolName
+      }
+      return out
+    }
+    const llm = (runId: string, messages: unknown) =>
+      ((messages as Message[] | undefined) ?? [])
+        .filter((m) => m && m.role !== ('extension' as never))
+        .map((m) => observedMessage(runId, m))
+    /** The pi event for a yoagent one, or nothing (the types a subscribed observer does not use). */
+    const piEvent = (event: Record<string, unknown> & { type: string; run: RunInfo }): Record<string, unknown> | undefined => {
+      const runId = event.run.run_id
+      switch (event.type) {
+        case 'agentStart':
+          turns.set(runId, 0)
+          return { type: 'agent_start' }
+        case 'agentEnd': {
+          turns.delete(runId)
+          for (const key of running.keys()) if (key.startsWith(`${runId}/`)) running.delete(key)
+          const messages = llm(runId, event.messages)
+          ending.delete(runId)
+          return { type: 'agent_end', messages }
+        }
+        case 'turnStart':
+          return { type: 'turn_start', turnIndex: turns.get(runId) ?? 0, timestamp: Date.now() }
+        case 'turnEnd': {
+          const turnIndex = turns.get(runId) ?? 0
+          turns.set(runId, turnIndex + 1)
+          const message = event.message as Message
+          // As pi: only a turn that ended with an assistant message (not a stop or cancel marker).
+          if (message?.role !== 'assistant') return undefined
+          const stop = (message as { stopReason?: string }).stopReason
+          const toolResults = llm(runId, event.toolResults)
+          return {
+            type: 'turn_end',
+            turnIndex,
+            message: observedMessage(runId, message),
+            toolResults,
+            // No session entries in yoagent: ids for this run and turn, and an empty boundary.
+            messageEntryId: `${runId}/turn-${turnIndex}`,
+            toolResultEntryIds: toolResults.map((_, i) => `${runId}/turn-${turnIndex}/result-${i}`),
+            entries: [],
+            continue: false,
+            context: { contextEntries: [], contextMessages: [], llmMessages: [], pendingMessages: [], canContinue: false },
+            outcome: stop === 'aborted' ? 'aborted' : stop === 'error' ? 'error' : 'completed',
+          }
+        }
+        case 'messageStart':
+          return { type: 'message_start', message: observedMessage(runId, event.message as Message) }
+        case 'messageUpdate': {
+          const message = observedMessage(runId, event.message as Message) as { content?: unknown[] }
+          const delta = event.delta as { type: string; delta: string }
+          return {
+            type: 'message_update',
+            message,
+            assistantMessageEvent: {
+              type: DELTA_TYPES[delta.type] ?? `${delta.type}_delta`,
+              contentIndex: Math.max(0, (message.content?.length ?? 1) - 1),
+              delta: delta.delta,
+              partial: message,
+            },
+          }
+        }
+        case 'toolExecutionStart': {
+          const call = piCall(runId, event.toolName as string, event.args)
+          running.set(`${runId}/${event.toolCallId}`, call)
+          return { type: 'tool_execution_start', toolCallId: event.toolCallId, ...call }
+        }
+        case 'toolExecutionUpdate': {
+          const call = running.get(`${runId}/${event.toolCallId}`) ?? piCall(runId, event.toolName as string, undefined)
+          return { type: 'tool_execution_update', toolCallId: event.toolCallId, ...call, partialResult: event.partialResult }
+        }
+        case 'toolExecutionEnd': {
+          const key = `${runId}/${event.toolCallId}`
+          const call = running.get(key) ?? piCall(runId, event.toolName as string, undefined)
+          running.delete(key)
+          return {
+            type: 'tool_execution_end',
+            toolCallId: event.toolCallId,
+            toolName: call.toolName,
+            result: event.result,
+            isError: event.isError,
+          }
+        }
+        default:
+          return undefined
+      }
+    }
+    /**
+     * Fires a yoagent event's pi counterpart at its handlers. The pi event is built now (the
+     * run's tools are still known), the handlers run later on one ordered chain: `on_event`
+     * returns at once, so a slow observer (a tracer flushing over the network) never meets the
+     * bridge's per-event timeout, which would switch every observer off for the run (and fail a
+     * required bridge's run). At most MAX_OBSERVER_BACKLOG events wait; past that, events are
+     * dropped, reported once. Never throws: a throwing handler is reported once (per extension
+     * and event) and the others still run; a result is ignored (a `turn_end` asking to continue
+     * or add entries is reported once).
+     */
+    let chain: Promise<void> = Promise.resolve()
+    let backlog = 0
+    let dropped = 0
+    let closed = false
+    const mappingFailed = new Set<string>()
+    /** Once per run, extension and kind of trouble: a failure in a later run is reported again. */
+    const once = (key: string, level: 'warn' | 'info', text: string) => {
+      if (observerFailed.has(key)) return
+      observerFailed.add(key)
+      report(level, text)
+    }
+    const runHandlers = async (pi: Record<string, unknown>, runId: string) => {
+      for (const { ext, fn } of handlers(pi.type as string)) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          const call = Promise.resolve().then(() => fn(structuredClone(pi), context()))
+          const budget = new Promise<'late'>((resolve) => {
+            timer = setTimeout(() => resolve('late'), OBSERVER_HANDLER_BUDGET_MS)
+          })
+          const result = (await Promise.race([call, budget])) as
+            | 'late'
+            | { continue?: unknown; entries?: unknown[] }
+            | undefined
+          if (result === 'late') {
+            // Left running; the queue moves on so one stuck handler cannot stall every observer.
+            call.catch(() => {})
+            once(
+              `${runId}\0${ext.path}\0${pi.type}\0late`,
+              'warn',
+              `[pi] ${short(ext.path)}: a ${pi.type} handler did not finish within ${OBSERVER_HANDLER_BUDGET_MS / 1000} s; ` +
+                `the observers went on without it (reported once per run)`,
+            )
+          } else if (pi.type === 'turn_end' && result && (result.continue || (result.entries?.length ?? 0) > 0)) {
+            once(
+              `${ext.path}\0turn_end-result`,
+              'warn',
+              `[pi] ${short(ext.path)}: a turn_end result (continue / entries) is not applied in yoagent; ignored`,
+            )
+          }
+        } catch (error) {
+          once(
+            `${runId}\0${ext.path}\0${pi.type}`,
+            'warn',
+            `[pi] ${short(ext.path)}: a ${pi.type} handler threw (reported once per run): ${message(error)}`,
+          )
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      // The run is over for its observers: its once-per-run keys can go.
+      if (pi.type === 'agent_end') {
+        for (const key of observerFailed) if (key.startsWith(`${runId}\0`)) observerFailed.delete(key)
+      }
+    }
+    /**
+     * Fires a yoagent event's pi counterpart at its handlers. The pi event is built now (the
+     * run's tools are still known), the handlers run later on one ordered chain: `on_event`
+     * returns at once, so a slow observer (a tracer flushing over the network) never meets the
+     * bridge's per-event timeout, which would switch every observer off for the run (and fail a
+     * required bridge's run). A handler gets OBSERVER_HANDLER_BUDGET_MS before the queue moves
+     * on. Past MAX_OBSERVER_BACKLOG waiting events streaming events are dropped (lifecycle ones
+     * past twice that), counted and reported when the queue catches up. Never throws: a
+     * throwing handler is reported once per run and the others still run; a result is ignored
+     * (a `turn_end` asking to continue or add entries is reported once).
+     */
+    const observe = async (event: Record<string, unknown> & { type: string; run: RunInfo }) => {
+      if (refusal || closed) {
+        ending.clear()
+        return
+      }
+      let pi: Record<string, unknown> | undefined
+      try {
+        pi = piEvent(event)
+      } catch (error) {
+        if (!mappingFailed.has(event.type)) {
+          mappingFailed.add(event.type)
+          report('warn', `[pi] could not map ${event.type} events for pi observers (reported once): ${message(error)}`)
+        }
+        return
+      }
+      if (!pi) return
+      const limit = STREAMING_EVENTS.has(pi.type as string) ? MAX_OBSERVER_BACKLOG : 2 * MAX_OBSERVER_BACKLOG
+      if (backlog >= limit) {
+        if (dropped++ === 0) {
+          report('warn', `[pi] observers are ${backlog} events behind; dropping events until they catch up`)
+        }
+        return
+      }
+      backlog++
+      const next = pi
+      const runId = event.run.run_id
+      chain = chain
+        .then(() => runHandlers(next, runId))
+        .catch((error) => report('warn', `[pi] observer queue: ${message(error)}`))
+        .finally(() => {
+          backlog--
+          if (backlog === 0 && dropped > 0) {
+            report('warn', `[pi] observers caught up; ${dropped} events were dropped`)
+            dropped = 0
+          }
+        })
+    }
+    drainObservers = async () => {
+      closed = true
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const done = await Promise.race([
+        chain.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), OBSERVER_DRAIN_MS)
+        }),
+      ])
+      clearTimeout(timer)
+      if (!done) report('warn', `[pi] unloading with ${backlog} observer events still queued`)
+    }
 
     ctx.effect(
       yoagent.register(config.name ?? 'pi-extensions', {
@@ -1540,9 +1860,21 @@ export default definePlugin<Config>({
           ended.delete(outcome.run_id)
           queue.delete(outcome.run_id)
           for (const key of judged.keys()) if (key.startsWith(`${outcome.run_id}/`)) judged.delete(key)
+          // `agentEnd` comes after `finish`: it names tools from what this run offered.
+          const snapshot = snapshots.get(outcome.run_id)
+          if (snapshot && subscribed.has('agentEnd')) ending.set(outcome.run_id, snapshot)
           snapshots.delete(outcome.run_id)
+          // Observer bookkeeping: whatever event types are subscribed (the bridge delivers the
+          // run's events before `finish`; only `agentEnd`, which needs neither, comes after).
+          turns.delete(outcome.run_id)
+          for (const key of running.keys()) if (key.startsWith(`${outcome.run_id}/`)) running.delete(key)
         },
-      }, watching ? { messages: true } : undefined),
+        // Only with observer handlers at load: pi's observer events, from yoagent's.
+        ...(subscribed.size > 0 ? { on_event: observe } : {}),
+      }, {
+        ...(watching ? { messages: true } : {}),
+        ...(subscribed.size > 0 ? { events: [...subscribed] } : {}),
+      }),
     )
   },
 })
