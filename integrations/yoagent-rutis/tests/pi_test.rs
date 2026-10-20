@@ -2241,3 +2241,251 @@ export default function (pi) {
         ["turn_end", "agent_end", "shutdown"]
     );
 }
+
+/// `execFor` grants `pi.exec` per extension file, over the row-wide `exec`:
+/// one extension may run `echo`, its neighbour may not. A key is resolved like
+/// `extensions` (relative to `cwd`); a key naming no loaded extension refuses
+/// the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_grants_per_extension() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let source = |tool: &str| {
+        format!(
+            "export default function (pi) {{ pi.registerTool({{ name: '{tool}', label: '{tool}', description: 'x', \
+             parameters: {{ type: 'object', properties: {{}} }}, \
+             async execute() {{ const r = await pi.exec('echo', ['hi']); return {{ content: [{{ type: 'text', text: `code=${{r.code}}` }}], details: {{}} }} }} }}) }}"
+        )
+    };
+    let granted = extension(dir.path(), "granted.ts", &source("granted_exec"));
+    let other = extension(dir.path(), "other.ts", &source("other_exec"));
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": [granted, other],
+        "execFor": { granted.to_str().unwrap(): ["echo"] },
+    })))
+    .await;
+    let (agent, _) = agent(vec![
+        calls(&[("granted_exec", json!({})), ("other_exec", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    assert_eq!(results[1].1, "code=126", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    // A per-extension `false` over a row-wide `true`.
+    let host = crate::host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": [granted, other],
+        "exec": true,
+        "execFor": { other.to_str().unwrap(): false },
+    })))
+    .await;
+    let (agent, _) = crate::agent(vec![
+        calls(&[("granted_exec", json!({})), ("other_exec", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    assert_eq!(results[1].1, "code=126", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    // The same grant spelled relative to `cwd`.
+    let host = crate::host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": ["./granted.ts"],
+        "cwd": dir.path(),
+        "execFor": { "./granted.ts": ["echo"] },
+    })))
+    .await;
+    let (agent, _) = crate::agent(vec![call("granted_exec", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0", "{results:?}");
+    host.root.shutdown().await.unwrap();
+
+    let host = crate::host(&runtime).await;
+    let failures = host
+        .try_load(adapter_row(json!({
+            "extensions": [granted],
+            "execFor": { dir.path().join("typo.ts").to_str().unwrap(): true },
+        })))
+        .await;
+    assert!(failures.contains("not loaded"), "{failures}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// `ctx.model` and `ctx.modelRegistry`: the host's `model` and `models`, read
+/// only (credentials and model calls refused, `refresh` a no-op, chat the only
+/// type, nothing to serialize or overwrite); without them, the run's model id
+/// under provider `yoagent`. A malformed model refuses the load.
+#[tokio::test(flavor = "multi_thread")]
+async fn extensions_see_the_host_s_models_read_only() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ext = extension(
+        dir.path(),
+        "models.ts",
+        r#"
+export default function (pi) {
+  pi.registerTool({
+    name: 'pi_models', label: 'pi_models', description: 'x', parameters: { type: 'object', properties: {} },
+    async execute(_id, _params, _signal, _update, ctx) {
+      let refused = ''
+      try { await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model) } catch (e) { refused = String(e.message) }
+      const registry = ctx.modelRegistry
+      let overwritten = true
+      try { registry.getAll = () => []; overwritten = registry.getAll().length === 0 } catch { overwritten = false }
+      const out = {
+        model: ctx.model && `${ctx.model.provider}/${ctx.model.id}`,
+        window: ctx.model?.contextWindow,
+        all: ctx.modelRegistry.getAll().map((m) => `${m.provider}/${m.id}`),
+        found: !!ctx.modelRegistry.find('deepseek', 'deepseek-flash'),
+        refused,
+        refreshed: (await registry.refresh()).aborted,
+        chat: registry.getModelsOfType('chat').length,
+        images: registry.getModelsOfType('image').length,
+        foundOfType: !!registry.findOfType('chat', 'deepseek', 'deepseek-flash'),
+        json: JSON.stringify(registry),
+        overwritten,
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(out) }], details: {} }
+    },
+  })
+}
+"#,
+    );
+    let check = |config: Value| {
+        let ext = ext.clone();
+        let runtime = runtime.clone();
+        async move {
+            let host = host(&runtime).await;
+            let mut row = json!({ "extensions": [ext] });
+            row.as_object_mut()
+                .unwrap()
+                .extend(config.as_object().unwrap().clone());
+            host.load(adapter_row(row)).await;
+            let (agent, _) = agent(vec![call("pi_models", json!({})), text("done")]);
+            let mut agent = agent.with_extension(host.bridge.extension());
+            let (_, results) = run(&mut agent, "go").await;
+            host.root.shutdown().await.unwrap();
+            serde_json::from_str::<Value>(&results[0].1).unwrap_or_else(|_| panic!("{results:?}"))
+        }
+    };
+    let seen = check(json!({
+        "model": { "provider": "deepseek", "id": "deepseek-flash", "contextWindow": 1000000 },
+        "models": [
+            { "provider": "deepseek", "id": "deepseek-flash" },
+            { "provider": "anthropic", "id": "claude-sonnet-5-5" },
+        ],
+    }))
+    .await;
+    assert_eq!(seen["model"], "deepseek/deepseek-flash", "{seen}");
+    assert_eq!(seen["window"], 1_000_000, "{seen}");
+    assert_eq!(
+        seen["all"],
+        json!(["deepseek/deepseek-flash", "anthropic/claude-sonnet-5-5"]),
+        "{seen}"
+    );
+    assert_eq!(seen["found"], true, "{seen}");
+    assert!(
+        seen["refused"]
+            .as_str()
+            .unwrap()
+            .contains("not available in yoagent"),
+        "{seen}"
+    );
+    assert_eq!(seen["refreshed"], false, "{seen}");
+    assert_eq!(seen["chat"], 2, "{seen}");
+    assert_eq!(seen["images"], 0, "{seen}");
+    assert_eq!(seen["foundOfType"], true, "{seen}");
+    assert_eq!(seen["json"], "{}", "{seen}");
+    assert_eq!(seen["overwritten"], false, "{seen}");
+    // `model` alone: the registry lists it.
+    let seen = check(json!({ "model": { "provider": "deepseek", "id": "deepseek-flash" } })).await;
+    assert_eq!(seen["all"], json!(["deepseek/deepseek-flash"]), "{seen}");
+    // No model configured: the run's model id, and an empty registry.
+    let seen = check(json!({})).await;
+    assert_eq!(
+        seen["model"],
+        format!("yoagent/{}", yoagent::provider::ModelConfig::mock().id),
+        "{seen}"
+    );
+    assert_eq!(seen["all"], json!([]), "{seen}");
+
+    let host = host(&runtime).await;
+    let failures = host
+        .try_load(adapter_row(json!({
+            "extensions": [ext],
+            "model": { "provider": "deepseek" },
+        })))
+        .await;
+    assert!(failures.contains("model must be"), "{failures}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// Without a host `model`, `ctx.model` is each run's own: a parent's tool
+/// called after a sub-agent (on another model) ran sees the parent's model,
+/// and each run's `agent_end` observer — which comes after the run's `finish`
+/// — sees its own run's.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctx_model_is_per_run() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("ends.log");
+    let ext = extension(
+        dir.path(),
+        "model.ts",
+        &format!(
+            r#"
+import {{ appendFileSync }} from 'node:fs'
+export default function (pi) {{
+  pi.registerTool({{
+    name: 'pi_model', label: 'pi_model', description: 'x', parameters: {{ type: 'object', properties: {{}} }},
+    async execute(_id, _params, _signal, _update, ctx) {{
+      return {{ content: [{{ type: 'text', text: String(ctx.model?.id) }}], details: {{}} }}
+    }},
+  }})
+  pi.on('agent_end', (_event, ctx) => appendFileSync({log:?}, `${{ctx.model?.id}}\n`))
+}}
+"#
+        ),
+    );
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({ "extensions": [ext] }))).await;
+    let (child, _) = recording(vec![text("child done")]);
+    let mut child_model = yoagent::provider::ModelConfig::mock();
+    child_model.id = "child-model".into();
+    let sub = yoagent::SubAgentTool::from_provider("helper", child, child_model);
+    let (parent, _) = agent(vec![
+        calls(&[("helper", json!({ "task": "x" })), ("pi_model", json!({}))]),
+        text("done"),
+    ]);
+    let mut parent = parent
+        .with_sub_agent(sub)
+        .with_tool_execution(yoagent::ToolExecutionStrategy::Sequential)
+        .with_tree_extension(host.bridge.extension());
+    let (_, results) = run(&mut parent, "go").await;
+    let parent_model = yoagent::provider::ModelConfig::mock().id;
+    let own = results.iter().find(|(name, _, _)| name == "pi_model");
+    assert_eq!(
+        own.map(|(_, out, _)| out.as_str()),
+        Some(parent_model.as_str()),
+        "{results:?}"
+    );
+    let ends = wait_file(&log, |t| t.lines().count() >= 2).await;
+    assert_eq!(
+        ends.lines().collect::<Vec<_>>(),
+        ["child-model", parent_model.as_str()]
+    );
+    host.root.shutdown().await.unwrap();
+}

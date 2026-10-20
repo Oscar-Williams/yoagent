@@ -193,8 +193,117 @@ export interface Config {
    * This gates pi's API only: an extension is code the host runs and may start processes itself.
    */
   exec?: boolean | string[]
+  /**
+   * Grants for single extensions, over `exec`: an extension file (as in `extensions`, resolved
+   * against `cwd`) → its own `true` / `false` / command list. A key naming no loaded extension
+   * refuses the load (a typo would otherwise grant nothing, silently).
+   */
+  execFor?: Record<string, boolean | string[]>
   /** What `ctx.isProjectTrusted()` answers (default `false`; pi's own default is `true`). */
   projectTrusted?: boolean
+  /**
+   * What `ctx.model` is: the model the agent runs. Default: the run's model id (from yoagent's
+   * request), under provider `yoagent`; before the first request, `undefined`.
+   */
+  model?: ModelSpec
+  /**
+   * What `ctx.modelRegistry` lists (`getAll`, `getAvailable`, `find`; default: `model`, if
+   * set). Read-only: its other methods — credentials, model calls, provider registration —
+   * throw "not available in yoagent".
+   */
+  models?: ModelSpec[]
+}
+
+/** A model as the host describes it to pi extensions. */
+export interface ModelSpec {
+  provider: string
+  id: string
+  name?: string
+  contextWindow?: number
+  maxTokens?: number
+  reasoning?: boolean
+  /** Input kinds (default `["text"]`). */
+  input?: ('text' | 'image')[]
+}
+
+/** A host's model in pi's `Model` shape (frozen; `api` is `yoagent`, no costs or credentials). */
+function piModel(spec: ModelSpec) {
+  return Object.freeze({
+    id: spec.id,
+    name: spec.name ?? spec.id,
+    api: 'yoagent',
+    provider: spec.provider,
+    baseUrl: '',
+    input: Object.freeze([...(spec.input ?? ['text'])]),
+    cost: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+    reasoning: spec.reasoning ?? false,
+    contextWindow: spec.contextWindow ?? 128_000,
+    maxTokens: spec.maxTokens ?? 4_096,
+  })
+}
+
+/** Whether `value` is a usable `ModelSpec`. */
+const isModelSpec = (value: unknown): value is ModelSpec => {
+  const m = value as ModelSpec
+  return (
+    !!m &&
+    typeof m === 'object' &&
+    typeof m.provider === 'string' &&
+    !!m.provider &&
+    typeof m.id === 'string' &&
+    !!m.id &&
+    (m.name === undefined || typeof m.name === 'string') &&
+    (m.contextWindow === undefined || (Number.isInteger(m.contextWindow) && m.contextWindow > 0)) &&
+    (m.maxTokens === undefined || (Number.isInteger(m.maxTokens) && m.maxTokens > 0)) &&
+    (m.reasoning === undefined || typeof m.reasoning === 'boolean') &&
+    (m.input === undefined || (Array.isArray(m.input) && m.input.every((i) => i === 'text' || i === 'image')))
+  )
+}
+
+/**
+ * A read-only `ModelRegistry` over the host's models: the lookups pi extensions use to see
+ * models (all of them chat models; `refresh` does nothing); everything else (credentials, model
+ * calls, registering providers) throws, reported once. It cannot be written to.
+ */
+function readOnlyRegistry(models: ReturnType<typeof piModel>[]) {
+  const find = (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id)
+  const ofType = (type: string, provider?: string) =>
+    type === 'chat' ? models.filter((m) => provider === undefined || m.provider === provider) : []
+  const reads: Record<string, (...args: never[]) => unknown> = {
+    getAll: () => [...models],
+    getAvailable: () => [...models],
+    find,
+    findOfType: (type: string, provider: string, id: string) => (type === 'chat' ? find(provider, id) : undefined),
+    getModelOfType: (type: string, provider: string, id: string) => (type === 'chat' ? find(provider, id) : undefined),
+    getModelsOfType: ofType,
+    getAvailableOfType: async (type: string, provider?: string) => ofType(type, provider),
+    refresh: async () => ({ aborted: false, errors: new Map() }),
+    getError: () => undefined,
+    getProviderDisplayName: (provider: string) => provider,
+    hasConfiguredAuth: () => false,
+    isUsingOAuth: () => false,
+    getRegisteredProviderIds: () => [...new Set(models.map((m) => m.provider))],
+  }
+  const refused = new Set<string>()
+  return new Proxy(reads, {
+    set: () => false,
+    defineProperty: () => false,
+    setPrototypeOf: () => false,
+    deleteProperty: () => false,
+    get: (target, key) => {
+      // Not a promise, and `JSON.stringify` sees an object with no own data.
+      if (typeof key !== 'string' || key === 'then' || key === 'toJSON') return undefined
+      if (key in target) return target[key]
+      return () => {
+        const why = `ctx.modelRegistry.${key}() is not available in yoagent (no credentials, model calls or providers are handed to extensions)`
+        if (!refused.has(key)) {
+          refused.add(key)
+          report('info', `[pi] ${why}`)
+        }
+        throw new Error(why)
+      }
+    },
+  })
 }
 
 /**
@@ -652,15 +761,19 @@ async function writeWrapper(dir: string, resolved: string): Promise<string> {
   return wrapper
 }
 
-/** `pi.exec` as the host's `exec` grant allows it; everything else on pi's API as it is. */
-function gateExec(exec: boolean | string[]) {
+/**
+ * `pi.exec` as the host's grant for the extension at `path` allows it (`grantFor`: its own in
+ * `execFor`, else the row-wide `exec`); everything else on pi's API as it is.
+ */
+function gateExec(grantFor: (path: string) => boolean | string[]) {
   const refusedOnce = new Set<string>()
   return (pi: PiApi, path: string): PiApi => {
+    const exec = grantFor(path)
     if (exec === true) return pi
     const allowed = (command: string) => Array.isArray(exec) && exec.includes(command)
     const gated = (command: string, args: string[], options?: unknown): Promise<ExecResult> => {
       if (allowed(command)) return pi.exec(command, args, options)
-      const why = `pi.exec("${command}") is not allowed by the host (the adapter's \`exec\` setting)`
+      const why = `pi.exec("${command}") is not allowed by the host (the adapter's \`exec\` / \`execFor\` setting)`
       const key = `${path}\0${command}`
       if (!refusedOnce.has(key)) {
         refusedOnce.add(key)
@@ -767,7 +880,13 @@ export default definePlugin<Config>({
       strict: { type: 'boolean' },
       nestedCalls: { type: 'string', enum: ['any', 'own-extension', 'off'] },
       exec: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+      execFor: {
+        type: 'object',
+        additionalProperties: { anyOf: [{ type: 'boolean' }, { type: 'array', items: { type: 'string' } }] },
+      },
       projectTrusted: { type: 'boolean' },
+      model: { type: 'object' },
+      models: { type: 'array', items: { type: 'object' } },
     },
   },
   async apply(ctx, config) {
@@ -792,15 +911,43 @@ export default definePlugin<Config>({
 
     const { SessionManager } = await import('@earendil-works/pi-coding-agent')
     const { validateToolArguments } = await import('@earendil-works/pi-ai')
+    const isGrant = (g: unknown): g is boolean | string[] =>
+      typeof g === 'boolean' || (Array.isArray(g) && g.every((c) => typeof c === 'string'))
     const exec = config.exec ?? false
-    if (typeof exec !== 'boolean' && !(Array.isArray(exec) && exec.every((c) => typeof c === 'string'))) {
-      throw new Error(`exec must be true, false or a list of commands, not ${JSON.stringify(exec)}`)
-    }
-    report(
-      'debug',
-      `[pi] pi.exec allowed: ${exec === true ? 'anything' : exec === false || exec.length === 0 ? 'nothing' : exec.join(', ')}`,
+    if (!isGrant(exec)) throw new Error(`exec must be true, false or a list of commands, not ${JSON.stringify(exec)}`)
+    const shown = (g: boolean | string[]) => (g === true ? 'anything' : g === false || g.length === 0 ? 'nothing' : g.join(', '))
+    report('debug', `[pi] pi.exec allowed: ${shown(exec)}`)
+    // Per-extension grants, keyed by the resolved file as `loadGated` resolves `extensions`.
+    const { resolvePath } = await piModule<{ resolvePath(input: string, base: string, options?: unknown): string }>(
+      './utils/paths.js',
     )
-    const loaded = await loadGated(config.extensions, cwd, gateExec(exec))
+    const resolveExt = (path: string) => resolvePath(path, cwd, { normalizeUnicodeSpaces: true })
+    const execFor = new Map<string, boolean | string[]>()
+    for (const [path, grant] of Object.entries(config.execFor ?? {})) {
+      if (!isGrant(grant)) {
+        throw new Error(`execFor["${path}"] must be true, false or a list of commands, not ${JSON.stringify(grant)}`)
+      }
+      execFor.set(resolveExt(path), grant)
+      report('debug', `[pi] pi.exec allowed for ${path}: ${shown(grant)}`)
+    }
+    const listed = new Set(config.extensions.map(resolveExt))
+    const unknown = [...execFor.keys()].filter((path) => !listed.has(path))
+    if (unknown.length > 0) {
+      throw new Error(`execFor names extensions that are not loaded: ${unknown.join(', ')}`)
+    }
+    // Models extensions see (`ctx.model`, `ctx.modelRegistry`).
+    for (const [what, spec] of [['model', config.model] as const, ...(config.models ?? []).map((m, i) => [`models[${i}]`, m] as const)]) {
+      if (spec !== undefined && !isModelSpec(spec)) {
+        throw new Error(`${what} must be {provider, id, name?, contextWindow?, maxTokens?, reasoning?, input?}, not ${JSON.stringify(spec)}`)
+      }
+    }
+    const hostModel = config.model ? piModel(config.model) : undefined
+    const registry = readOnlyRegistry(config.models ? config.models.map(piModel) : hostModel ? [hostModel] : [])
+    /** Per run, the id of the model its latest request used (when the host names no `model`). */
+    const runModels = new Map<string, string>()
+    /** The latest request's model of any run: for contexts outside a run (`session_start`, ...). */
+    let latestModel: string | undefined
+    const loaded = await loadGated(config.extensions, cwd, gateExec((path) => execFor.get(path) ?? exec))
     if (loaded.errors.length > 0) {
       throw new Error(`pi extensions failed to load: ${loaded.errors.map((e) => `${e.path}: ${e.error}`).join('; ')}`)
     }
@@ -838,7 +985,9 @@ export default definePlugin<Config>({
         return undefined
       }
     }
-    const context = (signal?: AbortSignal, systemPrompt = '') => {
+    /** The model id `ctx.model` names for a run: its latest request's, else any run's latest. */
+    const modelOf = (runId?: string) => (runId !== undefined ? runModels.get(runId) : undefined) ?? latestModel
+    const context = (signal?: AbortSignal, runId?: string, systemPrompt = '', modelId = modelOf(runId)) => {
       const hostUiService = lookupUi()
       return {
       ui: hostUiService ? hostUi(hostUiService, signal) : NO_UI,
@@ -847,10 +996,11 @@ export default definePlugin<Config>({
       cwd,
       sessionManager,
       get modelRegistry() {
-        return fixedAnswer('ctx.modelRegistry', undefined)
+        return fixedAnswer('ctx.modelRegistry', registry, `a read-only list of ${registry.getAll().length} model(s)`)
       },
       get model() {
-        return fixedAnswer('ctx.model', undefined)
+        const model = hostModel ?? (modelId ? piModel({ provider: 'yoagent', id: modelId }) : undefined)
+        return fixedAnswer('ctx.model', model, model ? `${model.provider}/${model.id}` : 'undefined')
       },
       scopedModels: [],
       signal,
@@ -945,7 +1095,7 @@ export default definePlugin<Config>({
         const event = { type: 'tool_call', toolCallId: id, parentToolCallId: parentId, toolName: name, input }
         let result: { block?: boolean; reason?: string; terminate?: boolean } | undefined
         try {
-          result = (await fn(event, context(signal))) as typeof result
+          result = (await fn(event, context(signal, runId))) as typeof result
         } catch (error) {
           return failed(`pi extension ${short(ext.path)} failed: ${message(error)}`, input)
         }
@@ -976,7 +1126,7 @@ export default definePlugin<Config>({
       }
       for (const { ext, fn } of handlers('tool_result')) {
         try {
-          const edit = (await fn(event, context(signal))) as { content?: Block[]; details?: unknown; isError?: boolean } | undefined
+          const edit = (await fn(event, context(signal, runId))) as { content?: Block[]; details?: unknown; isError?: boolean } | undefined
           if (edit?.content !== undefined) event.content = edit.content
           if (edit?.details !== undefined) event.details = edit.details
           if (edit?.isError !== undefined) event.isError = edit.isError
@@ -998,7 +1148,7 @@ export default definePlugin<Config>({
       let nested = 0
       // Added onto the context, not spread: a spread reads every getter, which would log
       // fixed answers (`ctx.model`, ...) no extension asked for.
-      return Object.defineProperties(context(signal), Object.getOwnPropertyDescriptors({
+      return Object.defineProperties(context(signal, runId), Object.getOwnPropertyDescriptors({
         get tools() {
           // The run's frozen copies (a tool cannot swap another's `execute` through them), only
           // those `nestedCalls` lets this tool call.
@@ -1238,7 +1388,7 @@ export default definePlugin<Config>({
             const before = canon(copy)
             let result: { message?: unknown } | undefined
             try {
-              result = (await fn({ type: 'message_end', message: copy }, context(signal))) as typeof result
+              result = (await fn({ type: 'message_end', message: copy }, context(signal, runId))) as typeof result
             } catch (error) {
               // Cut short: not judged, so not seen; the next check runs it again.
               if (signal?.aborted) return unfinished('message_end')
@@ -1255,7 +1405,7 @@ export default definePlugin<Config>({
         }
       })
     /** `context` on the messages a request sends; the refusal if a handler would change them. */
-    const checkContext = async (messages: Message[] | undefined, signal?: AbortSignal) => {
+    const checkContext = async (runId: string, messages: Message[] | undefined, signal?: AbortSignal) => {
       const listeners = handlers('context')
       if (!messages || listeners.length === 0) return
       for (const { ext, fn } of listeners) {
@@ -1263,7 +1413,7 @@ export default definePlugin<Config>({
         const before = canon(copy)
         let result: { messages?: unknown } | undefined
         try {
-          result = (await fn({ type: 'context', messages: copy }, context(signal))) as typeof result
+          result = (await fn({ type: 'context', messages: copy }, context(signal, runId))) as typeof result
         } catch (error) {
           if (signal?.aborted) return unfinished('context')
           report('warn', `[pi] ${short(ext.path)} context: ${message(error)}`)
@@ -1309,7 +1459,7 @@ export default definePlugin<Config>({
     }
     const callKey = (call: ToolCall) => `${call.run_id}/${call.call_id}`
 
-    const startNote = async (prompt: string, signal: AbortSignal) => {
+    const startNote = async (prompt: string, signal: AbortSignal, runId: string) => {
       let systemPrompt = PROMPT_MARK
       for (const { ext, fn } of handlers('before_agent_start')) {
         const options = new Proxy({} as Record<string, unknown>, {
@@ -1320,7 +1470,7 @@ export default definePlugin<Config>({
         })
         const event = { type: 'before_agent_start', prompt, systemPrompt, systemPromptOptions: options }
         try {
-          const result = (await fn(event, context(signal, systemPrompt))) as
+          const result = (await fn(event, context(signal, runId, systemPrompt))) as
             | { systemPrompt?: unknown; message?: unknown }
             | undefined
           if (result?.message !== undefined) {
@@ -1385,7 +1535,7 @@ export default definePlugin<Config>({
     /** Per run: the turn index, and each running tool call's pi name and arguments. */
     const turns = new Map<string, number>()
     /** A run's tools kept past `finish` for its `agentEnd` (delivered after it), when subscribed. */
-    const ending = new Map<string, { offered: Map<string, PiTool> }>()
+    const ending = new Map<string, { offered: Map<string, PiTool>; model?: string }>()
     const running = new Map<string, { toolName: string; args: unknown }>()
     const observerFailed = new Set<string>()
     /** A yoagent tool call as pi names it: a pi tool keeps its name, a built-in gets pi's name and argument shape. */
@@ -1520,11 +1670,11 @@ export default definePlugin<Config>({
       observerFailed.add(key)
       report(level, text)
     }
-    const runHandlers = async (pi: Record<string, unknown>, runId: string) => {
+    const runHandlers = async (pi: Record<string, unknown>, runId: string, model: string | undefined) => {
       for (const { ext, fn } of handlers(pi.type as string)) {
         let timer: ReturnType<typeof setTimeout> | undefined
         try {
-          const call = Promise.resolve().then(() => fn(structuredClone(pi), context()))
+          const call = Promise.resolve().then(() => fn(structuredClone(pi), context(undefined, runId, '', model)))
           const budget = new Promise<'late'>((resolve) => {
             timer = setTimeout(() => resolve('late'), OBSERVER_HANDLER_BUDGET_MS)
           })
@@ -1579,6 +1729,9 @@ export default definePlugin<Config>({
         ending.clear()
         return
       }
+      // The run's model now, not when the handler runs: by then the run may have ended
+      // (`agentEnd` always comes after `finish`) and another run made the latest request.
+      const model = runModels.get(event.run.run_id) ?? ending.get(event.run.run_id)?.model ?? latestModel
       let pi: Record<string, unknown> | undefined
       try {
         pi = piEvent(event)
@@ -1601,7 +1754,7 @@ export default definePlugin<Config>({
       const next = pi
       const runId = event.run.run_id
       chain = chain
-        .then(() => runHandlers(next, runId))
+        .then(() => runHandlers(next, runId, model))
         .catch((error) => report('warn', `[pi] observer queue: ${message(error)}`))
         .finally(() => {
           backlog--
@@ -1716,7 +1869,7 @@ export default definePlugin<Config>({
             const event = { type: 'tool_call', toolCallId: call.call_id, toolName, input }
             let result: { block?: boolean; reason?: string; terminate?: boolean } | undefined
             try {
-              result = (await fn(event, context(call.signal))) as typeof result
+              result = (await fn(event, context(call.signal, call.run_id))) as typeof result
             } catch (error) {
               // As in pi: a failing tool_call handler blocks the call.
               return { deny: `pi extension ${short(ext.path)} failed: ${message(error)}` }
@@ -1770,7 +1923,7 @@ export default definePlugin<Config>({
           const failed: string[] = []
           for (const { ext, fn } of editors) {
             try {
-              const result = (await fn(event, context(call.signal))) as
+              const result = (await fn(event, context(call.signal, call.run_id))) as
                 | { content?: Block[]; details?: unknown; isError?: boolean }
                 | undefined
               if (result?.content !== undefined) {
@@ -1808,7 +1961,7 @@ export default definePlugin<Config>({
             const event = { type: 'input', text: input.text, source: 'interactive' }
             let result: { action?: string } | undefined
             try {
-              result = (await fn(event, context(input.signal))) as typeof result
+              result = (await fn(event, context(input.signal, input.run_id))) as typeof result
             } catch (error) {
               // Unlike pi (which goes on): an input check that failed rejects.
               return { reject: `pi extension ${short(ext.path)} failed: ${message(error)}` }
@@ -1821,6 +1974,10 @@ export default definePlugin<Config>({
         },
 
         async before_model(turn) {
+          if (typeof turn.model === 'string' && turn.model) {
+            runModels.set(turn.run_id, turn.model)
+            latestModel = turn.model
+          }
           checkUnmapped(false)
           checkShadowing(false)
           if (refusal) return { stop: refusal }
@@ -1829,13 +1986,13 @@ export default definePlugin<Config>({
           if (watching) {
             // Prompts and tool results ended since; then the context this request sends.
             const stopped =
-              (await checkEnded(turn.run_id, turn.messages, turn.signal)) ?? (await checkContext(turn.messages, turn.signal))
+              (await checkEnded(turn.run_id, turn.messages, turn.signal)) ?? (await checkContext(turn.run_id, turn.messages, turn.signal))
             if (stopped) return { stop: stopped }
           }
           if (handlers('before_agent_start').length === 0) return
           let note = notes.get(turn.run_id)
           if (!note) {
-            note = startNote(turn.latest_user_text ?? '', turn.signal)
+            note = startNote(turn.latest_user_text ?? '', turn.signal, turn.run_id)
             notes.set(turn.run_id, note)
           }
           const added = await note
@@ -1862,8 +2019,9 @@ export default definePlugin<Config>({
           for (const key of judged.keys()) if (key.startsWith(`${outcome.run_id}/`)) judged.delete(key)
           // `agentEnd` comes after `finish`: it names tools from what this run offered.
           const snapshot = snapshots.get(outcome.run_id)
-          if (snapshot && subscribed.has('agentEnd')) ending.set(outcome.run_id, snapshot)
+          if (snapshot && subscribed.has('agentEnd')) ending.set(outcome.run_id, { ...snapshot, model: runModels.get(outcome.run_id) })
           snapshots.delete(outcome.run_id)
+          runModels.delete(outcome.run_id)
           // Observer bookkeeping: whatever event types are subscribed (the bridge delivers the
           // run's events before `finish`; only `agentEnd`, which needs neither, comes after).
           turns.delete(outcome.run_id)
