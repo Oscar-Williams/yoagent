@@ -19,7 +19,9 @@ use std::time::Duration;
 use common::*;
 use rutis::{Ctx, FiberState};
 use rutis_bridge::runtime::LocalRuntime;
-use rutis_bridge::session::{host_key, HostDispatch, Reply, Value as BridgeValue};
+use rutis_bridge::session::{
+    host_key, Error as BridgeError, HostDispatch, Reply, Value as BridgeValue,
+};
 use rutis_loader::{
     Chain, EntryStatus, Layer, Loader, LoaderOptions, LoaderPlugin, Patch, RuntimeResolver,
     RuntimeRowsPlugin, ServiceCatalog,
@@ -103,13 +105,18 @@ async fn host(runtime: &Path) -> Host {
 
 /// [`host`], with a host `ui` service when given.
 async fn host_with_ui(runtime: &Path, ui: Option<Arc<dyn HostDispatch>>) -> Host {
+    host_with(runtime, ui.map(|ui| ("ui", ui)).into_iter().collect()).await
+}
+
+/// [`host`], with these host services (shared by name).
+async fn host_with(runtime: &Path, services: Vec<(&str, Arc<dyn HostDispatch>)>) -> Host {
     let root = Ctx::root().unwrap();
     let bridge = RutisBridge::install(&root).unwrap();
     let mut catalog = ServiceCatalog::new();
     catalog.register_shared("yoagent");
-    if let Some(ui) = ui {
-        catalog.register_shared("ui");
-        root.provide_as::<dyn HostDispatch>(host_key("ui"), ui)
+    for (name, service) in services {
+        catalog.register_shared(name);
+        root.provide_as::<dyn HostDispatch>(host_key(name), service)
             .unwrap();
     }
     let node = LocalRuntime::node(runtime, pi_dir().join("package.json"));
@@ -2487,5 +2494,604 @@ export default function (pi) {{
         ends.lines().collect::<Vec<_>>(),
         ["child-model", parent_model.as_str()]
     );
+    host.root.shutdown().await.unwrap();
+}
+
+/// yobuild's `host_approval`, scripted by the call's first argument: `free`
+/// is free, `yes` / `no` are asked (and answered "allow" / "block"), `boom`
+/// cannot be judged. Every call is recorded with its arguments.
+#[derive(Default)]
+struct FakeApproval(Mutex<Vec<(String, Value)>>);
+
+impl HostDispatch for FakeApproval {
+    fn invoke(&self, method: &str, args: BridgeValue) -> Reply {
+        let args: Vec<Value> = args
+            .list()?
+            .into_iter()
+            .map(|a| a.json().unwrap_or(Value::Null))
+            .collect();
+        self.0
+            .lock()
+            .unwrap()
+            .push((method.into(), Value::Array(args.clone())));
+        match method {
+            "judge" => match args[0][1].as_str() {
+                _ if args[0][0] == "pwd" => Ok(BridgeValue::Data(json!({ "free": true }))),
+                Some("free") => Ok(BridgeValue::Data(json!({ "free": true, "judged": true }))),
+                Some("boom") => Err(BridgeError::Value("the gate broke".into())),
+                _ => Ok(BridgeValue::Data(
+                    json!({ "free": false, "judged": true, "question": "Run echo?", "details": "argv" }),
+                )),
+            },
+            "ask" => Ok(BridgeValue::Data(json!(
+                if args[0] == "Run echo?" && args[1] == "argv" {
+                    // Which call is asked about is not in `ask`'s arguments: the last judged one.
+                    let judged = self
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|(m, _)| m == "judge")
+                        .cloned();
+                    match judged
+                        .and_then(|(_, a)| a[0][1].as_str().map(str::to_owned))
+                        .as_deref()
+                    {
+                        Some("yes") => json!("allow"),
+                        Some("unans") => json!("unanswered"),
+                        // Truthy, but not "allow".
+                        Some("truthy") => json!(true),
+                        Some("askboom") => {
+                            return Err(BridgeError::Value("the question broke".into()))
+                        }
+                        _ => json!("block"),
+                    }
+                } else {
+                    json!("unanswered")
+                }
+            ))),
+            _ => Ok(BridgeValue::Undefined),
+        }
+    }
+
+    fn methods(&self) -> Option<Value> {
+        Some(json!({ "judge": "async", "ask": "async" }))
+    }
+}
+
+/// `exec: "gate"` per extension: each `pi.exec` is judged by the host, a call
+/// it frees runs, one it asks about runs only on "allow", and a block, a
+/// judge that fails or a host without `host_approval` (no `host-approval.ts`
+/// row) refuse it (126). `judge` gets the argv and `options.cwd` resolved;
+/// `ask` gets the judge's question and details and the extension's file. An
+/// extension without the grant is refused without asking.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_gate_asks_the_host() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let source = |tool: &str| {
+        format!(
+            "export default function (pi) {{ pi.registerTool({{ name: '{tool}', label: '{tool}', description: 'x', \
+             parameters: {{ type: 'object', properties: {{ arg: {{ type: 'string' }}, cwd: {{ type: 'string' }} }} }}, \
+             async execute(_id, p) {{ const r = await pi.exec('echo', [p.arg], p.cwd ? {{ cwd: p.cwd }} : undefined); \
+             return {{ content: [{{ type: 'text', text: `code=${{r.code}} out=${{r.stdout.trim()}} err=${{r.stderr}}` }}], details: {{}} }} }} }}) }}"
+        )
+    };
+    let gated = extension(dir.path(), "gated.ts", &source("gated_exec"));
+    let other = extension(dir.path(), "other.ts", &source("other_exec"));
+    let row = || {
+        json!({
+            "extensions": [&gated, &other],
+            "cwd": dir.path(),
+            "execFor": { gated.to_str().unwrap(): "gate" },
+        })
+    };
+    for with_service in [true, false] {
+        let approval = Arc::new(FakeApproval::default());
+        let host = host_with(
+            &runtime,
+            vec![("host_approval", approval.clone() as Arc<dyn HostDispatch>)],
+        )
+        .await;
+        let mut rows = adapter_row(row());
+        if with_service {
+            rows.as_array_mut()
+                .unwrap()
+                .push(json!({ "id": "host-approval", "name": pi_dir().join("host-approval.ts") }));
+        }
+        host.load(rows).await;
+        let (agent, _) = agent(vec![
+            calls(&[
+                ("gated_exec", json!({ "arg": "free", "cwd": "sub" })),
+                ("gated_exec", json!({ "arg": "yes" })),
+                ("gated_exec", json!({ "arg": "no" })),
+                ("gated_exec", json!({ "arg": "boom" })),
+                ("gated_exec", json!({ "arg": "unans" })),
+                ("gated_exec", json!({ "arg": "truthy" })),
+                ("gated_exec", json!({ "arg": "askboom" })),
+                ("other_exec", json!({ "arg": "free" })),
+            ]),
+            text("done"),
+        ]);
+        let mut agent = agent
+            .with_tool_execution(yoagent::ToolExecutionStrategy::Sequential)
+            .with_extension(host.bridge.extension());
+        let (_, results) = run(&mut agent, "go").await;
+        let out: Vec<&str> = results.iter().map(|(_, o, _)| o.as_str()).collect();
+        if with_service {
+            assert!(out[0].starts_with("code=0 out=free"), "{out:?}");
+            assert!(out[1].starts_with("code=0 out=yes"), "{out:?}");
+            assert!(
+                out[2].starts_with("code=126")
+                    && out[2].contains("not approved by the host (block)"),
+                "{out:?}"
+            );
+            assert!(
+                out[3].starts_with("code=126")
+                    && out[3].contains("could not judge it")
+                    && out[3].contains("the gate broke"),
+                "{out:?}"
+            );
+            // Only "allow" runs: an unanswered question, a truthy answer and a failed one refuse.
+            for (o, want) in [
+                (out[4], "(unanswered)"),
+                (out[5], "(true)"),
+                (out[6], "the question broke"),
+            ] {
+                assert!(o.starts_with("code=126") && o.contains(want), "{out:?}");
+            }
+            assert!(
+                out[7].starts_with("code=126") && out[7].contains("is not allowed by the host"),
+                "{out:?}"
+            );
+            let seen = approval.0.lock().unwrap().clone();
+            let sub = dir.path().join("sub");
+            let resolved_sub = std::fs::canonicalize(&sub).unwrap();
+            assert_eq!(seen[0].0, "judge");
+            assert_eq!(seen[0].1[0], json!(["echo", "free"]));
+            let cwd = seen[0].1[1].as_str().unwrap();
+            assert!(
+                Path::new(cwd) == sub || Path::new(cwd) == resolved_sub,
+                "{cwd}"
+            );
+            // A call without `options.cwd` sends none.
+            assert_eq!(seen[1], ("judge".into(), json!([["echo", "yes"]])));
+            assert_eq!(seen[2].0, "ask");
+            assert_eq!(seen[2].1[0], "Run echo?");
+            assert_eq!(seen[2].1[1], "argv");
+            assert!(
+                seen[2].1[2].as_str().unwrap().ends_with("gated.ts"),
+                "the file is the last argument: {seen:?}"
+            );
+            // `free` and `boom` are never asked; `other` never judged.
+            let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+            assert_eq!(
+                methods,
+                [
+                    "judge", "judge", "ask", "judge", "ask", "judge", "judge", "ask", "judge",
+                    "ask", "judge", "ask"
+                ]
+            );
+        } else {
+            for o in &out[..7] {
+                assert!(
+                    o.starts_with("code=126") && o.contains("no host_approval service"),
+                    "{out:?}"
+                );
+            }
+            assert!(approval.0.lock().unwrap().is_empty());
+        }
+        host.root.shutdown().await.unwrap();
+    }
+
+    // A bad grant refuses the load.
+    let host = host(&runtime).await;
+    let failures = host
+        .try_load(adapter_row(
+            json!({ "extensions": [&gated], "exec": "ask" }),
+        ))
+        .await;
+    assert!(failures.contains("exec must be true, false"), "{failures}");
+    host.root.shutdown().await.unwrap();
+}
+
+/// yobuild's `host_session`: wakes recorded with their arguments; a text
+/// containing `refuse` is refused.
+#[derive(Default)]
+struct WakeLog(Mutex<Vec<Value>>);
+
+impl HostDispatch for WakeLog {
+    fn invoke(&self, method: &str, args: BridgeValue) -> Reply {
+        let args: Vec<Value> = args
+            .list()?
+            .into_iter()
+            .map(|a| a.json().unwrap_or(Value::Null))
+            .collect();
+        if method == "wake" {
+            self.0.lock().unwrap().push(Value::Array(args.clone()));
+            if args[0].as_str().is_some_and(|t| t.contains("refuse")) {
+                return Err(BridgeError::Value("not now".into()));
+            }
+        }
+        Ok(BridgeValue::Undefined)
+    }
+
+    fn methods(&self) -> Option<Value> {
+        Some(json!({ "wake": "async", "info": "async" }))
+    }
+}
+
+/// `projectTrustedFor` and `wakeFor` per extension: a granted extension's
+/// `pi.sendUserMessage` and turn-starting `pi.sendMessage` wake the host's
+/// session (`wake(text, file)`, blocks as text; a refusal does not reach the
+/// extension); its neighbour's `sendUserMessage` still throws, and each sees
+/// its own `ctx.isProjectTrusted()`. Unknown keys and bad values refuse the
+/// load.
+#[tokio::test(flavor = "multi_thread")]
+async fn trust_and_wake_per_extension() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let late = dir.path().join("late.log");
+    let source = |tool: &str| {
+        format!(
+            "import {{ appendFileSync }} from 'node:fs'\nexport default function (pi) {{ pi.registerTool({{ name: '{tool}', label: '{tool}', description: 'x', \
+             parameters: {{ type: 'object', properties: {{}} }}, \
+             async execute(_id, _p, _s, _u, ctx) {{ let sent = 'sent'; \
+             try {{ pi.sendUserMessage('hello\\nworld'); pi.sendUserMessage('please refuse'); \
+             pi.sendMessage({{ customType: 'note', content: [{{ type: 'text', text: 'm1' }}, {{ type: 'text', text: 'm2' }}] }}, {{ triggerTurn: true }}); \
+             pi.sendMessage({{ customType: 'note', content: 'quiet' }}); \
+             pi.sendMessage({{ customType: 'note', content: 'd' }}, {{ deliverAs: 'steer' }}); \
+             pi.sendUserMessage('end') }} catch (e) {{ sent = e.message }} \
+             return {{ content: [{{ type: 'text', text: `${{ctx.isProjectTrusted()}}|${{sent}}` }}], details: {{}} }} }} }}); \
+             pi.on('session_shutdown', () => {{ try {{ pi.sendUserMessage('late') }} catch (e) {{ \
+             appendFileSync({late:?}, `{tool}: ${{e.message}}\n`) }} }}) }}"
+        )
+    };
+    let woken = extension(dir.path(), "woken.ts", &source("woken_tool"));
+    let quiet = extension(dir.path(), "quiet.ts", &source("quiet_tool"));
+    let session = Arc::new(WakeLog::default());
+    let host = host_with(
+        &runtime,
+        vec![("host_session", session.clone() as Arc<dyn HostDispatch>)],
+    )
+    .await;
+    let mut rows = adapter_row(json!({
+        "extensions": [&woken, &quiet],
+        "projectTrusted": false,
+        "projectTrustedFor": { woken.to_str().unwrap(): true },
+        "wakeFor": { woken.to_str().unwrap(): true },
+    }));
+    rows.as_array_mut()
+        .unwrap()
+        .push(json!({ "id": "host-session", "name": pi_dir().join("host-session.ts") }));
+    host.load(rows).await;
+    let (agent, _) = agent(vec![
+        calls(&[("woken_tool", json!({})), ("quiet_tool", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "true|sent", "{results:?}");
+    assert_eq!(
+        results[1].1, "false|pi.sendUserMessage() is not available in yoagent",
+        "{results:?}"
+    );
+    let file = woken.to_str().unwrap();
+    // Wakes are sent one at a time: once "end" is in, every earlier one has been decided.
+    let wakes = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let seen = session.0.lock().unwrap().clone();
+            if seen.iter().any(|w| w[0] == "end") {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the wakes");
+    let texts: Vec<&str> = wakes.iter().map(|w| w[0].as_str().unwrap()).collect();
+    // The quiet `sendMessage` (no turn) wakes nothing; `deliverAs` alone does.
+    assert_eq!(
+        texts,
+        ["hello\nworld", "please refuse", "m1\nm2", "d", "end"],
+        "{wakes:?}"
+    );
+    for w in &wakes {
+        assert!(
+            w[1].as_str().unwrap().ends_with("woken.ts"),
+            "{w:?} vs {file}"
+        );
+    }
+    host.root.shutdown().await.unwrap();
+    // Unloading: a wake from `session_shutdown` throws, as pi's own runtime once it is gone;
+    // the neighbour throws "not available" as ever.
+    let said = wait_file(&late, |t| t.lines().count() >= 2).await;
+    assert!(
+        said.contains("woken_tool: Extension runtime not initialized"),
+        "{said}"
+    );
+    assert!(
+        said.contains("quiet_tool: pi.sendUserMessage() is not available"),
+        "{said}"
+    );
+    assert!(!session.0.lock().unwrap().iter().any(|w| w[0] == "late"));
+
+    for (bad, want) in [
+        (
+            json!({ "wakeFor": { dir.path().join("typo.ts").to_str().unwrap(): true } }),
+            "not loaded",
+        ),
+        (
+            json!({ "projectTrustedFor": { dir.path().join("typo.ts").to_str().unwrap(): true } }),
+            "not loaded",
+        ),
+        (
+            json!({ "projectTrustedFor": { woken.to_str().unwrap(): "yes" } }),
+            "must be true or false",
+        ),
+        // One file under two spellings.
+        (
+            json!({ "wakeFor": {
+            woken.to_str().unwrap(): true,
+            dir.path().join(".").join("woken.ts").to_str().unwrap(): false,
+        } }),
+            "twice",
+        ),
+        (json!({ "wakeFor": true }), "wakeFor"),
+    ] {
+        let host = crate::host(&runtime).await;
+        let mut row = json!({ "extensions": [&woken] });
+        row.as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        let failures = host.try_load(adapter_row(row)).await;
+        assert!(failures.contains(want), "{bad}: {failures}");
+        host.root.shutdown().await.unwrap();
+    }
+}
+
+/// The gate runs exactly what it judged: an extension that changes its
+/// argument array while the host is asked still runs the judged command, a
+/// `cwd` that is not a path string is refused unjudged, and a granted wake
+/// from an extension's factory (while extensions load) throws as pi's own
+/// runtime does, reaching no host.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_runs_what_it_judged() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let ext = extension(
+        dir.path(),
+        "tricky.ts",
+        r#"
+let atLoad = 'no error'
+export default function (pi) {
+  try { pi.sendUserMessage('from the factory') } catch (e) { atLoad = e.message }
+  const tool = (name, run) => pi.registerTool({
+    name, label: name, description: 'x', parameters: { type: 'object', properties: {} },
+    async execute() { return { content: [{ type: 'text', text: await run() }], details: {} } },
+  })
+  tool('swap_args', async () => {
+    const args = ['yes']
+    const pending = pi.exec('echo', args)
+    args[0] = 'swapped'
+    const r = await pending
+    return `code=${r.code} out=${r.stdout.trim()}`
+  })
+  tool('url_cwd', async () => {
+    const r = await pi.exec('echo', ['free'], { cwd: new URL('file:///') })
+    return `code=${r.code} err=${r.stderr}`
+  })
+  tool('at_load', async () => atLoad)
+  tool('where_sub', async () => (await pi.exec('pwd', [], { cwd: 'sub' })).stdout.trim())
+  tool('where_default', async () => (await pi.exec('pwd', [])).stdout.trim())
+}
+"#,
+    );
+    let approval = Arc::new(FakeApproval::default());
+    let session = Arc::new(WakeLog::default());
+    let host = host_with(
+        &runtime,
+        vec![
+            ("host_approval", approval.clone() as Arc<dyn HostDispatch>),
+            ("host_session", session.clone() as Arc<dyn HostDispatch>),
+        ],
+    )
+    .await;
+    let mut rows = adapter_row(json!({
+        "extensions": [&ext],
+        "cwd": dir.path(),
+        "exec": "gate",
+        "wakeFor": { ext.to_str().unwrap(): true },
+    }));
+    rows.as_array_mut().unwrap().extend([
+        json!({ "id": "host-approval", "name": pi_dir().join("host-approval.ts") }),
+        json!({ "id": "host-session", "name": pi_dir().join("host-session.ts") }),
+    ]);
+    host.load(rows).await;
+    let (agent, _) = agent(vec![
+        calls(&[
+            ("swap_args", json!({})),
+            ("url_cwd", json!({})),
+            ("at_load", json!({})),
+            ("where_sub", json!({})),
+            ("where_default", json!({})),
+        ]),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tool_execution(yoagent::ToolExecutionStrategy::Sequential)
+        .with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert_eq!(results[0].1, "code=0 out=yes", "{results:?}");
+    assert!(
+        results[1].1.starts_with("code=126") && results[1].1.contains("must be a path string"),
+        "{results:?}"
+    );
+    assert!(
+        results[2].1.contains("Extension runtime not initialized"),
+        "{results:?}"
+    );
+    // A gated call runs where it was judged: `options.cwd` resolved against the adapter's
+    // `cwd`, and without one the adapter's `cwd` itself.
+    let canonical = |p: &str| std::fs::canonicalize(p).unwrap();
+    assert_eq!(
+        canonical(&results[3].1),
+        canonical(dir.path().join("sub").to_str().unwrap())
+    );
+    assert_eq!(
+        canonical(&results[4].1),
+        canonical(dir.path().to_str().unwrap())
+    );
+    // `swap_args` was judged (and asked about) as `echo yes`; `url_cwd` never reached the host.
+    let seen = approval.0.lock().unwrap().clone();
+    assert_eq!(seen[0], ("judge".into(), json!([["echo", "yes"]])));
+    assert_eq!(seen[1].0, "ask");
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(session.0.lock().unwrap().is_empty());
+    host.root.shutdown().await.unwrap();
+}
+
+/// The host's `host_approval` with an `ask` that answers only when the test
+/// says so (and "allow" then): for a cancel while the user is asked.
+struct LateApproval(Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+
+impl HostDispatch for LateApproval {
+    fn invoke(&self, method: &str, _args: BridgeValue) -> Reply {
+        match method {
+            "judge" => Ok(BridgeValue::Data(json!({ "free": false, "question": "q" }))),
+            "ask" => {
+                let answer = self.0.lock().unwrap().take();
+                Ok(BridgeValue::future(async move {
+                    if let Some(answer) = answer {
+                        let _ = answer.await;
+                    }
+                    Ok(BridgeValue::Data(json!("allow")))
+                }))
+            }
+            _ => Ok(BridgeValue::Undefined),
+        }
+    }
+
+    fn methods(&self) -> Option<Value> {
+        Some(json!({ "judge": "async", "ask": "async" }))
+    }
+}
+
+/// A gated call fails closed on its own cancel: aborted before the host is
+/// asked, it is not judged; aborted while the user is asked, it is refused at
+/// once and a later "allow" runs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_gated_call_never_runs() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let ext = extension(
+        dir.path(),
+        "cancel.ts",
+        &format!(
+            r#"
+export default function (pi) {{
+  const tool = (name, run) => pi.registerTool({{
+    name, label: name, description: 'x', parameters: {{ type: 'object', properties: {{}} }},
+    async execute() {{ const r = await run(); return {{ content: [{{ type: 'text', text: `code=${{r.code}} err=${{r.stderr}}` }}], details: {{}} }} }},
+  }})
+  tool('pre_aborted', () => {{ const ac = new AbortController(); ac.abort(); return pi.exec('touch', [{marker:?}], {{ signal: ac.signal }}) }})
+  tool('abort_in_ask', () => {{
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), 300)
+    return pi.exec('touch', [{marker:?}], {{ signal: ac.signal }})
+  }})
+}}
+"#
+        ),
+    );
+    let (answer, later) = tokio::sync::oneshot::channel();
+    let approval = Arc::new(LateApproval(Mutex::new(Some(later))));
+    let host = host_with(
+        &runtime,
+        vec![("host_approval", approval.clone() as Arc<dyn HostDispatch>)],
+    )
+    .await;
+    let mut rows = adapter_row(json!({ "extensions": [&ext], "exec": "gate" }));
+    rows.as_array_mut()
+        .unwrap()
+        .push(json!({ "id": "host-approval", "name": pi_dir().join("host-approval.ts") }));
+    host.load(rows).await;
+    let (agent, _) = agent(vec![
+        calls(&[("pre_aborted", json!({})), ("abort_in_ask", json!({}))]),
+        text("done"),
+    ]);
+    let mut agent = agent
+        .with_tool_execution(yoagent::ToolExecutionStrategy::Sequential)
+        .with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    for (_, out, _) in &results {
+        assert!(
+            out.starts_with("code=126") && out.contains("cancelled while the host was asked"),
+            "{results:?}"
+        );
+    }
+    // The user allows it now: nothing runs.
+    answer.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!marker.exists(), "a cancelled call ran after a late allow");
+    host.root.shutdown().await.unwrap();
+}
+
+/// `projectTrustedFor: false` over a row-wide `true` reaches the extension's
+/// handlers too: its `tool_call` policy and its `session_start`.
+#[tokio::test(flavor = "multi_thread")]
+async fn untrusted_for_one_extension_reaches_its_handlers() {
+    let Some(runtime) = node_runtime() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("trust.log");
+    let wary = extension(
+        dir.path(),
+        "wary.ts",
+        &format!(
+            r#"
+import {{ appendFileSync }} from 'node:fs'
+export default function (pi) {{
+  pi.on('session_start', (_e, ctx) => {{ appendFileSync({log:?}, `start=${{ctx.isProjectTrusted()}}\n`) }})
+  pi.on('tool_call', (e, ctx) => e.toolName === 'probe' ? {{ block: true, reason: `trusted=${{ctx.isProjectTrusted()}}` }} : undefined)
+}}
+"#
+        ),
+    );
+    let probe = extension(
+        dir.path(),
+        "probe.ts",
+        "export default function (pi) { pi.registerTool({ name: 'probe', label: 'p', description: 'x', \
+         parameters: { type: 'object', properties: {} }, \
+         async execute() { return { content: [{ type: 'text', text: 'ran' }], details: {} } } }) }",
+    );
+    let host = host(&runtime).await;
+    host.load(adapter_row(json!({
+        "extensions": [&wary, &probe],
+        "projectTrusted": true,
+        "projectTrustedFor": { wary.to_str().unwrap(): false },
+    })))
+    .await;
+    let (agent, _) = agent(vec![call("probe", json!({})), text("done")]);
+    let mut agent = agent.with_extension(host.bridge.extension());
+    let (_, results) = run(&mut agent, "go").await;
+    assert!(
+        results[0].2 && results[0].1.contains("trusted=false"),
+        "{results:?}"
+    );
+    assert_eq!(wait_file(&log, |t| !t.is_empty()).await, "start=false\n");
     host.root.shutdown().await.unwrap();
 }
