@@ -71,12 +71,28 @@ pub(crate) fn tool_result_text(content: &[crate::types::Content]) -> String {
 /// message, a stop marker or a compaction summary right after them), so these
 /// builders produce one wire message per result. Merging keeps every block in
 /// order: the results first, in call order, then whatever followed them.
+///
+/// A message whose `key` array is empty is dropped first, of either role:
+/// both APIs reject an empty message, and a turn that errored, was refused or
+/// was cancelled with no content (the loop's error message is one empty text
+/// block, which the builders filter), or whose only content is thinking the
+/// provider does not replay, would otherwise be one. Its neighbours then
+/// merge, so the roles still alternate (#369). A first message dropped this
+/// way can leave an assistant turn first, which Bedrock rejects — as it
+/// rejected the empty message before.
 pub(crate) fn merge_same_role(
     messages: Vec<serde_json::Value>,
     key: &str,
 ) -> Vec<serde_json::Value> {
     let mut merged: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
     for message in messages {
+        if message
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            continue;
+        }
         if let Some(last) = merged.last_mut() {
             if last.get("role") == message.get("role") {
                 let from = message.get(key).and_then(serde_json::Value::as_array);
@@ -129,6 +145,53 @@ pub(crate) fn parallel_tool_conversation() -> Vec<crate::types::Message> {
 mod merge_same_role_tests {
     use super::merge_same_role;
     use serde_json::json;
+
+    /// An empty message is dropped, first, in the middle or last, and its
+    /// neighbours merge: an assistant turn that errored with no content
+    /// between two user turns leaves one user message (#369).
+    #[test]
+    fn empty_messages_are_dropped_and_their_neighbours_merge() {
+        let merged = merge_same_role(
+            vec![
+                json!({"role": "user", "parts": []}),
+                json!({"role": "user", "parts": [{"text": "1"}]}),
+                json!({"role": "model", "parts": []}),
+                json!({"role": "user", "parts": [{"text": "2"}]}),
+                json!({"role": "model", "parts": [{"text": "3"}]}),
+                json!({"role": "model", "parts": []}),
+            ],
+            "parts",
+        );
+        assert_eq!(
+            merged,
+            vec![
+                json!({"role": "user", "parts": [{"text": "1"}, {"text": "2"}]}),
+                json!({"role": "model", "parts": [{"text": "3"}]}),
+            ]
+        );
+    }
+
+    /// An empty user message is dropped too, and the model turns around it
+    /// then merge (#369).
+    #[test]
+    fn an_empty_user_message_is_dropped() {
+        let merged = merge_same_role(
+            vec![
+                json!({"role": "user", "content": [{"text": "a"}]}),
+                json!({"role": "assistant", "content": [{"text": "x"}]}),
+                json!({"role": "user", "content": []}),
+                json!({"role": "assistant", "content": [{"text": "y"}]}),
+            ],
+            "content",
+        );
+        assert_eq!(
+            merged,
+            vec![
+                json!({"role": "user", "content": [{"text": "a"}]}),
+                json!({"role": "assistant", "content": [{"text": "x"}, {"text": "y"}]}),
+            ]
+        );
+    }
 
     #[test]
     fn adjacent_same_role_messages_become_one_in_order() {
