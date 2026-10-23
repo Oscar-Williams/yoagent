@@ -244,6 +244,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86
       - uses: Swatinem/rust-cache@v2
+      # resolver = "3" skips dependency versions whose declared rust-version is
+      # too new, but a crate that declares none is taken at its newest. (A
+      # yoke-derive pin lived here until 0.8.3, which declared none and needed
+      # a newer std, was yanked; 0.8.4 declares 1.82 and yoke 0.8.4 requires
+      # it, so the pin broke resolution, 2026-10-23.)
       - name: Check
         run: cargo check --all-features
 
@@ -304,7 +309,7 @@ jobs:
       - name: Check
         run: cargo check --manifest-path "$MANIFEST" --all-targets
       - name: Check with the language features (rutis-bridge 0.12)
-        run: cargo check --manifest-path "$MANIFEST" --all-targets --features node,python,bun,go,websocket,loader,probe
+        run: cargo check --manifest-path "$MANIFEST" --all-targets --features node,python,bun,go,websocket,loader,probe,embedded-adapters
 
   # TypeScript (Node and Bun 1.4), Python and Go (1.24) plugins through rutis-bridge 0.12, end to end: real
   # Node 22 (the floor: pi needs 22.19, rutis 22)
@@ -369,15 +374,17 @@ jobs:
           "$PLUGINS/.venv/bin/pip" install -r "$PLUGINS/requirements.txt"
       - name: Clippy (each language feature, and all)
         run: |
-          for features in node python bun go websocket loader probe node,python,bun,go,websocket,loader,probe; do
+          for features in node python bun go websocket loader probe node,python,bun,go,websocket,loader,probe,embedded-adapters; do
             cargo clippy --manifest-path "$MANIFEST" --all-targets --features "$features"
           done
       - name: Documentation
-        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps --features node,python,bun,go,websocket,loader,probe
+        run: RUSTDOCFLAGS="-Dwarnings" cargo doc --manifest-path "$MANIFEST" --no-deps --features node,python,bun,go,websocket,loader,probe,embedded-adapters
       # `probe` adds tests/probe_test.rs: the pi and DSH adapters' fixtures
-      # through `yoagent_rutis::probe`.
+      # through `yoagent_rutis::probe`; `embedded-adapters` the check that
+      # `adapters::files()` lists every adapter file, and a probe through a
+      # written-out copy of them.
       - name: Test
-        run: cargo test --manifest-path "$MANIFEST" --features node,python,bun,go,websocket,loader,probe
+        run: cargo test --manifest-path "$MANIFEST" --features node,python,bun,go,websocket,loader,probe,embedded-adapters
       - name: Example
         run: cargo run --manifest-path "$MANIFEST" --features node,python --example language_plugins
       - name: pi extensions example (scripted, the fixture extension)

@@ -1301,6 +1301,8 @@ async fn wait_paused(entered: &Notify) {
         .expect("the DSH call completed and its turn is still open");
 }
 
+/// A top-level run cancelled during a DSH call ends its turn `aborted` by the
+/// user, and the next run opens the next turn in the same session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_run_ends_its_dsh_turn_as_aborted_by_the_user() {
     let Some(runtime) = node_runtime() else {
@@ -1356,6 +1358,8 @@ impl RunHooks for FailAtStop {
     }
 }
 
+/// A run a required extension fails ends its turn `error`, with the run's
+/// error and the extension that failed it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_run_records_its_error_and_extension_in_the_dsh_turn() {
     let Some(runtime) = node_runtime() else {
@@ -1380,6 +1384,9 @@ async fn a_failed_run_records_its_error_and_extension_in_the_dsh_turn() {
     );
 }
 
+/// A second top-level run that finds the first's turn still open closes it
+/// `aborted` (hook) and opens its own; the first run's late `finish` must not
+/// close the second's turn (the owner guard — fails without it).
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overlapping_run_aborts_the_old_dsh_turn_and_keeps_its_own() {
     let Some(runtime) = node_runtime() else {
@@ -1420,6 +1427,8 @@ async fn an_overlapping_run_aborts_the_old_dsh_turn_and_keeps_its_own() {
     );
 }
 
+/// A host session reset (a new generation) closes the open turn `aborted`
+/// (disposed) in the old session; the new generation starts its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reset_disposes_the_open_dsh_turn_before_starting_a_new_generation() {
     let Some(runtime) = node_runtime() else {
@@ -1458,6 +1467,7 @@ async fn a_reset_disposes_the_open_dsh_turn_before_starting_a_new_generation() {
     assert_logged_turns(&logs, &new_id, &[json!({ "kind": "completed" })]);
 }
 
+/// Unloading the host closes the open turn `aborted` (disposed).
 #[tokio::test(flavor = "multi_thread")]
 async fn unloading_the_host_disposes_its_open_dsh_turn() {
     let Some(runtime) = node_runtime() else {

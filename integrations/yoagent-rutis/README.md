@@ -128,6 +128,8 @@ service `yoagent`:
 | `go` | Go plugins built with the rutis Go SDK (Go 1.24+, Linux/macOS): each binary is a runtime, started when a `go:<plugin>` row needs it (rutis-loader's `GoResolver` / `GoRuntimes`). A handler is a map of Go functions; a hook's `context.Context` is cancelled when the host gives the call up, as a JavaScript hook's `signal` aborts — see [`plugins/go/main.go`](plugins/go/main.go) |
 | `websocket` | runtimes and nodes on other machines, over `wss` |
 | `loader` | `rows::wait_running`: wait until the plugin rows a host loaded with rutis-loader run — `reconcile` counts a row still waiting as settled, and since rutis 0.12 a row injecting a service nobody provides waits for good — and name, per row still waiting, the services it injects that do not exist |
+| `probe` | `probe::pi` / `probe::dsh` (and `pi_with` / `dsh_with`): load a pi or DSH package through its adapter and report what an agent gets, without calling a tool or a model — see [Tools from other agent ecosystems](#tools-from-other-agent-ecosystems) (Linux/macOS; includes `node` and `loader`) |
+| `embedded-adapters` | `adapters::files()`: the pi and DSH adapter files built into the binary (about 370 KB), for hosts installed without this crate's source |
 
 ```toml
 yoagent-rutis = { git = "https://github.com/yologdev/yoagent", features = ["node", "python"] }
@@ -316,7 +318,13 @@ The adapters below ship in the crate (`plugins/pi`, `plugins/dsh`,
 `yoagent_rutis::adapters::adapters()` says where they are: the crate's own
 files, where it was built (cargo's registry or a path dependency). Copy
 the whole `root` (the adapters import `../yoagent.d.ts`) and run `npm ci`
-in the copy's `pi/` and `dsh/`; never install into the registry's.
+in the copy's `pi/` and `dsh/`; never install into the registry's. A host
+that runs without this crate's source (a `cargo install`ed or released
+binary) enables the `embedded-adapters` feature: `adapters::files()` is the
+pi and DSH adapter files and `yoagent.d.ts` (without the test fixtures)
+built in, `(path relative to plugins/, contents)`; write them under one
+folder — a new one per yoagent-rutis version — and run `npm ci` in its
+`pi/` and `dsh/`.
 
 With the `probe` feature, `yoagent_rutis::probe` loads a pi or DSH package
 through its adapter and reports what an agent gets — tools, prompt
